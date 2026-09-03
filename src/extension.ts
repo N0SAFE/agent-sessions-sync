@@ -39,7 +39,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     stateStore,
     trash,
-    log
+    log,
+    path.join(storageDir, 'sync-repo')
   );
   const statusBar = new StatusBar();
   const scheduler = new SyncScheduler(

@@ -8,6 +8,7 @@ import { forEachLimit } from '../util/async';
 import { describeUnit, isValidRepoPath, makeUnitOf, repoPathToLocal, repoPathToLocalRel, UnitFn } from '../util/paths';
 import { repoReadmeContent } from '../util/repoTemplate';
 import { buildVscodeDerivedFile, openWorkspaces, removeVscodeSessions, resolveVscodeLocalPath, restoreVscodeSessions, VscodeRestoreContext } from '../util/vscodeRestore';
+import { GitMirror } from '../github/mirror';
 import { computeSyncPlan, countUnits, mapsEqual } from './engine';
 import { ScanOptions, scanAgents } from './scanner';
 import { StateStore } from './stateStore';
@@ -47,14 +48,21 @@ export class SyncController implements vscode.Disposable {
   /** True while the controller itself is writing to a sessions dir — the watcher ignores those events. */
   applyingLocalChanges = false;
 
+  private lastToken = '';
+  private lastRemoteMap: FileShaMap = {};
+  private readonly mirror: GitMirror;
+
   constructor(
     private readonly getConfig: () => RepoConfig | undefined,
     private readonly getAgents: () => Agent[],
     private readonly getScanOptions: () => ScanOptions,
     private readonly stateStore: StateStore,
     private readonly trash: Trash,
-    private readonly log: vscode.LogOutputChannel
-  ) {}
+    private readonly log: vscode.LogOutputChannel,
+    mirrorDir?: string
+  ) {
+    this.mirror = new GitMirror(mirrorDir ?? path.join(os.tmpdir(), 'agent-sessions-sync-mirror'), (m) => log.debug(m));
+  }
 
   dispose(): void {
     this.statusEmitter.dispose();
@@ -148,6 +156,15 @@ export class SyncController implements vscode.Disposable {
     const cached = this.blobTextCache.get(sha);
     if (cached !== undefined) {
       return cached;
+    }
+    // Prefer the git mirror worktree when available (avoids a REST blob request).
+    if (GitMirror.isAvailable()) {
+      const entry = Object.entries(this.lastRemoteMap).find(([, s]) => s === sha);
+      if (entry && this.mirror.exists(entry[0])) {
+        const text = this.mirror.readFile(entry[0]).toString('utf8');
+        this.blobTextCache.set(sha, text);
+        return text;
+      }
     }
     if (!this.lastClient || !this.lastCfg) {
       throw new Error('Not connected to GitHub yet.');
@@ -252,6 +269,7 @@ export class SyncController implements vscode.Disposable {
   }
 
   private createClient(token: string, cfg: RepoConfig): GitHubClient {
+    this.lastToken = token;
     const client = new GitHubClient(token, (m) => this.log.debug(m));
     this.lastClient = client;
     this.lastCfg = cfg;
@@ -299,12 +317,32 @@ export class SyncController implements vscode.Disposable {
       return true;
     }
 
+    // Transport: the git mirror (bulk push/pull in one packfile) is preferred when the
+    // `git` binary is available; otherwise fall back to the REST Git Data API.
+    const useGit = GitMirror.isAvailable() && this.lastToken.length > 0;
     let remoteFiles: FileShaMap = {};
     let headTreeSha: string | undefined;
-    if (headSha) {
+    let blobProvider: (repoPath: string) => Promise<Buffer>;
+
+    if (useGit) {
+      this.mirror.ensureRepo(cfg.branch);
+      const branchExists = this.mirror.syncToRemote(cfg.owner, cfg.repo, cfg.branch, this.lastToken);
+      if (!headSha && !branchExists) {
+        // Branch missing: distinguish an empty repository from a wrong branch name.
+        const branches = await client.listBranches(cfg.owner, cfg.repo);
+        if (branches.length > 0) {
+          throw new Error(
+            `Branch '${cfg.branch}' not found in ${cfg.owner}/${cfg.repo}. Run "Agent Sessions Sync: Set Up / Change Repository" again.`
+          );
+        }
+      }
+      remoteFiles = this.mirror.remoteFileMap();
+      blobProvider = async (p) => this.mirror.readFile(p);
+    } else if (headSha) {
       const { treeSha } = await client.getCommit(cfg.owner, cfg.repo, headSha);
       headTreeSha = treeSha;
       remoteFiles = await this.fetchRemoteFiles(client, cfg, treeSha);
+      blobProvider = (p) => client.getBlob(cfg.owner, cfg.repo, remoteFiles[p]);
     } else {
       // Branch missing: distinguish an empty repository from a wrong branch name.
       const branches = await client.listBranches(cfg.owner, cfg.repo);
@@ -313,13 +351,16 @@ export class SyncController implements vscode.Disposable {
           `Branch '${cfg.branch}' not found in ${cfg.owner}/${cfg.repo}. Run "Agent Sessions Sync: Set Up / Change Repository" again.`
         );
       }
+      blobProvider = (p) => client.getBlob(cfg.owner, cfg.repo, remoteFiles[p]);
     }
+    this.lastRemoteMap = remoteFiles;
 
     const plan = computeSyncPlan(local, remoteFiles, base.files, unitFn, this.resolutions, frozen);
     this.log.info(
       `Plan: ${plan.uploads.length} upload(s), ${plan.downloads.length} download(s), ` +
         `${plan.removeRemote.length} remote deletion(s), ${plan.removeLocal.length} local deletion(s), ` +
-        `${plan.conflicts.length} conflict(s), ${plan.skipped.length} skipped unit(s)`
+        `${plan.conflicts.length} conflict(s), ${plan.skipped.length} skipped unit(s)` +
+        (useGit ? ' [git transport]' : ' [REST transport]')
     );
     if (plan.skipped.length > 0) {
       const shown = plan.skipped.slice(0, 5).join(', ');
@@ -341,7 +382,7 @@ export class SyncController implements vscode.Disposable {
     let removedUnits: RemovedUnit[] = [];
     this.applyingLocalChanges = true;
     try {
-      await this.applyDownloads(client, cfg, agents, plan, remoteFiles, scan.files);
+      await this.applyDownloads(client, cfg, agents, plan, remoteFiles, scan.files, blobProvider);
       removedUnits = await this.applyLocalRemovals(agents, plan, unitFn);
     } finally {
       this.applyingLocalChanges = false;
@@ -350,69 +391,82 @@ export class SyncController implements vscode.Disposable {
     // 2) Apply local → remote changes as a single commit.
     let newHead = headSha;
     if (plan.uploads.length > 0 || plan.removeRemote.length > 0) {
-      if (!newHead) {
-        // Empty repository: create the initial commit (README), then re-run the pass on the new head.
-        await this.initializeEmptyRepo(client, cfg);
-        return false;
-      }
-      const blobShaByPath: Record<string, string> = {};
-      await forEachLimit(plan.uploads, BLOB_CONCURRENCY, async (p) => {
-        // VS Code repo paths map to a custom layout (workspaceStorage/<hash>/
-        // chatSessions/<sid>.jsonl, global-storage empty-window sessions) that the
-        // generic repoPathToLocal does not understand; its meta.json/workspace.json
-        // sidecars are derived from the SQLite index and generated on the fly.
-        try {
-          let content: Buffer | undefined;
-          if (p.startsWith('vscode/')) {
-            const vscodeAgent = SyncController.vscodeAgent(agents);
-            const localPath = resolveVscodeLocalPath(vscodeAgent, p);
-            if (localPath) {
-              content = await fs.readFile(localPath);
-            } else {
-              content = await buildVscodeDerivedFile(vscodeAgent, p);
-            }
-          } else {
-            const localPath = repoPathToLocal(agents, p);
-            if (localPath) {
-              content = await fs.readFile(localPath);
-            }
-          }
+      const message = buildCommitMessage(plan, base.files, unitFn);
+      if (useGit) {
+        // Stage the full change set in the mirror and push once.
+        for (const p of plan.uploads) {
+          const content = await this.readUploadContent(agents, p);
           if (content === undefined) {
             this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
-            return;
+            delete plan.newBaseFiles[p];
+            continue;
           }
-          blobShaByPath[p] = await client.createBlob(cfg.owner, cfg.repo, content);
+          this.mirror.writeFile(p, content);
+        }
+        for (const p of plan.removeRemote) {
+          this.mirror.deleteFile(p);
+        }
+        if (!headSha) {
+          // Empty repository: seed a README so the branch starts with a meaningful root.
+          this.mirror.writeFile('README.md', Buffer.from(repoReadmeContent(cfg)));
+        }
+        const commitSha = this.mirror.commit(message);
+        try {
+          this.mirror.push(cfg.owner, cfg.repo, cfg.branch, this.lastToken);
         } catch (e) {
-          // Files can vanish between scan and upload (e.g. VS Code clears an editing
-          // session's state.json after the agent finishes). Skip them — the next scan
-          // sees the deletion and propagates it.
-          this.log.warn(`Skipping upload of ${p}: ${e instanceof Error ? e.message : String(e)}`);
-          delete plan.newBaseFiles[p];
+          if (/rejected|non-fast-forward|fetch first/i.test(String(e))) {
+            return false; // remote moved while we were pushing — re-run
+          }
+          throw e;
         }
-      });
-      const entries: TreeEntry[] = [
-        ...plan.uploads
-          .filter((p) => blobShaByPath[p] !== undefined)
-          .map((p) => ({ path: p, mode: '100644', type: 'blob', sha: blobShaByPath[p] })),
-        ...plan.removeRemote.map((p) => ({ path: p, mode: '100644', type: 'blob', sha: null })),
-      ];
-      const treeSha = await client.createTree(cfg.owner, cfg.repo, entries, headTreeSha);
-      const message = buildCommitMessage(plan, base.files, unitFn);
-      const commitSha = await client.createCommit(cfg.owner, cfg.repo, message, treeSha, [newHead]);
-      try {
-        await client.updateRef(cfg.owner, cfg.repo, cfg.branch, commitSha);
-      } catch (e) {
-        if (e instanceof GitHubError && (e.status === 422 || e.status === 409)) {
-          return false; // non-fast-forward: another device pushed meanwhile
+        newHead = commitSha;
+        this.log.info(`Pushed via git ${commitSha.slice(0, 8)}: ${message}`);
+      } else {
+        if (!newHead) {
+          // Empty repository: create the initial commit (README), then re-run the pass on the new head.
+          await this.initializeEmptyRepo(client, cfg);
+          return false;
         }
-        throw e;
+        const blobShaByPath: Record<string, string> = {};
+        await forEachLimit(plan.uploads, BLOB_CONCURRENCY, async (p) => {
+          try {
+            const content = await this.readUploadContent(agents, p);
+            if (content === undefined) {
+              this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
+              return;
+            }
+            blobShaByPath[p] = await client.createBlob(cfg.owner, cfg.repo, content);
+          } catch (e) {
+            // Files can vanish between scan and upload (e.g. VS Code clears an editing
+            // session's state.json after the agent finishes). Skip them — the next scan
+            // sees the deletion and propagates it.
+            this.log.warn(`Skipping upload of ${p}: ${e instanceof Error ? e.message : String(e)}`);
+            delete plan.newBaseFiles[p];
+          }
+        });
+        const entries: TreeEntry[] = [
+          ...plan.uploads
+            .filter((p) => blobShaByPath[p] !== undefined)
+            .map((p) => ({ path: p, mode: '100644', type: 'blob', sha: blobShaByPath[p] })),
+          ...plan.removeRemote.map((p) => ({ path: p, mode: '100644', type: 'blob', sha: null })),
+        ];
+        const treeSha = await client.createTree(cfg.owner, cfg.repo, entries, headTreeSha);
+        const commitSha = await client.createCommit(cfg.owner, cfg.repo, message, treeSha, [newHead]);
+        try {
+          await client.updateRef(cfg.owner, cfg.repo, cfg.branch, commitSha);
+        } catch (e) {
+          if (e instanceof GitHubError && (e.status === 422 || e.status === 409)) {
+            return false; // non-fast-forward: another device pushed meanwhile
+          }
+          throw e;
+        }
+        newHead = commitSha;
+        // The actual blob shas reported by GitHub become the BASE entries (file may have changed since scan).
+        for (const [p, sha] of Object.entries(blobShaByPath)) {
+          plan.newBaseFiles[p] = sha;
+        }
+        this.log.info(`Pushed commit ${commitSha.slice(0, 8)}: ${message}`);
       }
-      newHead = commitSha;
-      // The actual blob shas reported by GitHub become the BASE entries (file may have changed since scan).
-      for (const [p, sha] of Object.entries(blobShaByPath)) {
-        plan.newBaseFiles[p] = sha;
-      }
-      this.log.info(`Pushed commit ${commitSha.slice(0, 8)}: ${message}`);
     }
 
     // 3) Persist the new BASE and surface the result.
@@ -493,7 +547,8 @@ export class SyncController implements vscode.Disposable {
     agents: readonly Agent[],
     plan: SyncPlan,
     remoteFiles: FileShaMap,
-    localFiles: FileShaMap
+    localFiles: FileShaMap,
+    blobProvider: (repoPath: string) => Promise<Buffer>
   ): Promise<void> {
     if (plan.downloads.length === 0) {
       return;
@@ -505,7 +560,7 @@ export class SyncController implements vscode.Disposable {
 
     // Handle VS Code sessions specially
     if (vscodePaths.length > 0) {
-      await this.applyVscodeDownloads(client, cfg, agents, vscodePaths, remoteFiles);
+      await this.applyVscodeDownloads(client, cfg, agents, vscodePaths, remoteFiles, blobProvider);
     }
 
     // Handle other agents normally
@@ -528,10 +583,15 @@ export class SyncController implements vscode.Disposable {
           delete plan.newBaseFiles[p];
           return;
         }
-        const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[p]);
-        await fs.mkdir(path.dirname(localPath), { recursive: true });
-        await fs.writeFile(localPath, content);
-        this.log.info(`Downloaded ${p}`);
+        try {
+          const content = await blobProvider(p);
+          await fs.mkdir(path.dirname(localPath), { recursive: true });
+          await fs.writeFile(localPath, content);
+          this.log.info(`Downloaded ${p}`);
+        } catch (e) {
+          this.log.warn(`Skipping download of ${p}: ${e instanceof Error ? e.message : String(e)}`);
+          delete plan.newBaseFiles[p];
+        }
       });
     }
   }
@@ -541,7 +601,8 @@ export class SyncController implements vscode.Disposable {
     cfg: RepoConfig,
     agents: readonly Agent[],
     vscodePaths: string[],
-    remoteFiles: FileShaMap
+    remoteFiles: FileShaMap,
+    blobProvider: (repoPath: string) => Promise<Buffer>
   ): Promise<void> {
     const vscodeAgent = agents.find((a) => a.repoDir === 'vscode');
     if (!vscodeAgent) {
@@ -570,10 +631,24 @@ export class SyncController implements vscode.Disposable {
         if (!sha) {
           throw new Error(`No blob sha for ${repoPath}`);
         }
-        return client.getBlob(cfg.owner, cfg.repo, sha);
+        return blobProvider(repoPath);
       },
       (msg) => this.log.info(msg)
     );
+  }
+
+  /** Resolve the local content to upload for a repo path, or undefined when unresolvable. */
+  private async readUploadContent(agents: readonly Agent[], p: string): Promise<Buffer | undefined> {
+    if (p.startsWith('vscode/')) {
+      const vscodeAgent = SyncController.vscodeAgent(agents);
+      const localPath = resolveVscodeLocalPath(vscodeAgent, p);
+      if (localPath) {
+        return fs.readFile(localPath);
+      }
+      return buildVscodeDerivedFile(vscodeAgent, p);
+    }
+    const localPath = repoPathToLocal(agents, p);
+    return localPath ? fs.readFile(localPath) : undefined;
   }
 
   private async applyLocalRemovals(

@@ -97,7 +97,14 @@ Data flows one direction per module; UI never touches GitHub directly.
 - `src/sync/scheduler.ts` — startup sync, one file watcher per agent dir + debounce
   (default 30 s — sessions are written continuously), periodic poll, single-run queue.
 - `src/github/{auth,client}.ts` — VS Code built-in GitHub auth (`repo` scope) +
-  dependency-free REST client over global `fetch` (Git Data API).
+  dependency-free REST client over global `fetch` (Git Data API). Used for account/setup
+  and as a fallback transport.
+- `src/github/mirror.ts` — **GitMirror**: a local git mirror of the sync repository (in
+  `globalStorage/sync-repo`) that pushes/pulls via the **git smart protocol** (a single
+  packfile) instead of one REST request per blob. Used whenever `git` is on PATH; the REST
+  Git Data API remains the fallback. `syncToRemote` fetches+checks out the branch (or orphans
+  on an empty remote), `remoteFileMap` reads `git ls-tree`, uploads are staged + committed +
+  pushed in one go.
 - `src/ui/*` — status bar, setup wizard (warns on public repos — transcripts are sensitive),
   conflict resolution (native `vscode.diff`), quick menu, project-folder mapping
   (`projectMap.ts`: picks a repo folder via `controller.listRemoteFolders`, migrates the
