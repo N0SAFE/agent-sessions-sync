@@ -422,12 +422,18 @@ export class SyncController implements vscode.Disposable {
       const message = buildCommitMessage(plan, base.files, unitFn);
       if (useGit) {
         // Stage the full change set in the mirror and push once.
+        const skipUploads = new Set<string>();
         for (const p of plan.uploads) {
+          if (skipUploads.has(p)) {
+            delete plan.newBaseFiles[p];
+            continue;
+          }
           try {
             const content = await this.readUploadContent(agents, p);
             if (content === undefined) {
               this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
               delete plan.newBaseFiles[p];
+              this.skipSessionMeta(p, plan.uploads, skipUploads);
               continue;
             }
             this.mirror.writeFile(p, content);
@@ -437,6 +443,7 @@ export class SyncController implements vscode.Disposable {
             // sees the deletion and propagates it.
             this.log.warn(`Skipping upload of ${p}: ${e instanceof Error ? e.message : String(e)}`);
             delete plan.newBaseFiles[p];
+            this.skipSessionMeta(p, plan.uploads, skipUploads);
           }
         }
         for (const p of plan.removeRemote) {
@@ -464,11 +471,17 @@ export class SyncController implements vscode.Disposable {
           return false;
         }
         const blobShaByPath: Record<string, string> = {};
+        const skipUploads = new Set<string>();
         await forEachLimit(plan.uploads, BLOB_CONCURRENCY, async (p) => {
+          if (skipUploads.has(p)) {
+            delete plan.newBaseFiles[p];
+            return;
+          }
           try {
             const content = await this.readUploadContent(agents, p);
             if (content === undefined) {
               this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
+              this.skipSessionMeta(p, plan.uploads, skipUploads);
               return;
             }
             blobShaByPath[p] = await client.createBlob(cfg.owner, cfg.repo, content);
@@ -478,6 +491,7 @@ export class SyncController implements vscode.Disposable {
             // sees the deletion and propagates it.
             this.log.warn(`Skipping upload of ${p}: ${e instanceof Error ? e.message : String(e)}`);
             delete plan.newBaseFiles[p];
+            this.skipSessionMeta(p, plan.uploads, skipUploads);
           }
         });
         const entries: TreeEntry[] = [
@@ -697,6 +711,22 @@ export class SyncController implements vscode.Disposable {
     }
     const localPath = repoPathToLocal(agents, p);
     return localPath ? fs.readFile(localPath) : undefined;
+  }
+
+  /**
+   * When a session's conversation file can't be uploaded (it vanished mid-sync), also drop its
+   * `meta.json` so the repo never holds a meta-only session with no content.
+   */
+  private skipSessionMeta(p: string, uploads: readonly string[], skip: Set<string>): void {
+    const m = p.match(/^(.*\/chatSessions\/[^/]+)\/conversation\.(jsonl|json)$/);
+    if (!m) {
+      return;
+    }
+    const meta = `${m[1]}/meta.json`;
+    if (uploads.includes(meta)) {
+      skip.add(meta);
+      this.log.warn(`Skipping upload of ${meta}: session content (${p}) is not available locally.`);
+    }
   }
 
   private async applyLocalRemovals(
