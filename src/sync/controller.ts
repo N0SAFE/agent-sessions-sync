@@ -336,7 +336,7 @@ export class SyncController implements vscode.Disposable {
           );
         }
       }
-      remoteFiles = this.mirror.remoteFileMap();
+      remoteFiles = this.filterRemoteFileMap(this.mirror.remoteFileMap());
       blobProvider = async (p) => this.mirror.readFile(p);
     } else if (headSha) {
       const { treeSha } = await client.getCommit(cfg.owner, cfg.repo, headSha);
@@ -395,13 +395,21 @@ export class SyncController implements vscode.Disposable {
       if (useGit) {
         // Stage the full change set in the mirror and push once.
         for (const p of plan.uploads) {
-          const content = await this.readUploadContent(agents, p);
-          if (content === undefined) {
-            this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
+          try {
+            const content = await this.readUploadContent(agents, p);
+            if (content === undefined) {
+              this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
+              delete plan.newBaseFiles[p];
+              continue;
+            }
+            this.mirror.writeFile(p, content);
+          } catch (e) {
+            // Files can vanish between scan and upload (e.g. VS Code clears an editing
+            // session's state.json after the agent finishes). Skip them — the next scan
+            // sees the deletion and propagates it.
+            this.log.warn(`Skipping upload of ${p}: ${e instanceof Error ? e.message : String(e)}`);
             delete plan.newBaseFiles[p];
-            continue;
           }
-          this.mirror.writeFile(p, content);
         }
         for (const p of plan.removeRemote) {
           this.mirror.deleteFile(p);
@@ -537,6 +545,18 @@ export class SyncController implements vscode.Disposable {
         continue;
       }
       files[entry.path] = entry.sha;
+    }
+    return files;
+  }
+
+  /** Keep only agent-namespace files (mirror `git ls-tree` also lists README.md etc.). */
+  private filterRemoteFileMap(map: FileShaMap): FileShaMap {
+    const repoDirs = this.repoDirs();
+    const files: FileShaMap = {};
+    for (const [p, sha] of Object.entries(map)) {
+      if (isValidRepoPath(repoDirs, p)) {
+        files[p] = sha;
+      }
     }
     return files;
   }
