@@ -4,3 +4,4 @@ out-test/
 *.vsix
 .vscode-test/
 
+.local-build/
