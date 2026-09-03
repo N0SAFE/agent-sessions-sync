@@ -33,9 +33,11 @@ type Action = 'none' | 'upload' | 'removeRemote' | 'download' | 'removeLocal' | 
  * untouched this run — no actions in either direction, no conflict records, BASE entries
  * kept — and reported in `plan.skipped` when they would otherwise have produced an action.
  *
- * With `forceLocal`, the local side is authoritative everywhere: local wins every conflict,
- * sessions only on the remote are removed from it, sessions only on local are re-uploaded,
- * and nothing is ever deleted locally.
+ * With `forceLocal`, the local side wins every disagreement but nothing on other machines is
+ * destroyed: conflicts resolve in local's favor, sessions the repo is missing are re-uploaded,
+ * and sessions deleted only on the remote are kept locally and re-uploaded. Remote-only
+ * sessions are still downloaded, and nothing is ever deleted locally. (It does NOT remove
+ * remote-only sessions from the repository.)
  */
 export function computeSyncPlan(
   local: FileShaMap,
@@ -54,10 +56,8 @@ export function computeSyncPlan(
     const r: string | undefined = remote[p];
     const b: string | undefined = base[p];
     const resolution = resolutions.get(unitOf(p));
-    actions.set(
-      p,
-      forceLocal ? resolvedAction(l, r, b, 'local') : resolution ? resolvedAction(l, r, b, resolution) : classify(l, r, b)
-    );
+    const baseAction = resolution ? resolvedAction(l, r, b, resolution) : classify(l, r, b);
+    actions.set(p, forceLocal ? forceLocalAction(l, baseAction) : baseAction);
   }
 
   const conflictedUnits = new Set<string>();
@@ -187,4 +187,20 @@ function resolvedAction(
     return b === r ? 'none' : 'baseUpdate';
   }
   return 'download';
+}
+
+/**
+ * Force-local reclassification: the local side wins disagreements without destroying other
+ * machines' history. Conflicts upload when the file exists locally (or propagate the local
+ * deletion as removeRemote when local no longer has it); sessions the repo no longer has are
+ * re-uploaded instead of deleted locally. Downloads and normal remote deletions stay as-is.
+ */
+function forceLocalAction(l: string | undefined, action: Action): Action {
+  if (action === 'removeLocal') {
+    return 'upload';
+  }
+  if (action === 'conflict') {
+    return l === undefined ? 'removeRemote' : 'upload';
+  }
+  return action;
 }

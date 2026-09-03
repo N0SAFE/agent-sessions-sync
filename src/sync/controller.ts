@@ -150,16 +150,15 @@ export class SyncController implements vscode.Disposable {
   }
 
   /**
-   * Make the next sync treat THIS machine as authoritative: local wins every conflict,
-   * sessions that only exist on the remote are removed from it, sessions only on local are
-   * re-uploaded, and nothing is deleted locally. Ask first — this can remove remote-only
-   * history.
+   * Make the next sync treat THIS machine's local state as the winner: conflicts resolve in
+   * local's favor, sessions the repo is missing are re-uploaded, and local sessions are never
+   * deleted. Other machines' sessions are left in the repository (not removed).
    */
   async forceLocalSync(): Promise<void> {
     const choice = await vscode.window.showWarningMessage(
-      'Agent Sessions Sync: make THIS machine the source of truth? This overwrites the repository ' +
-        'with local state — sessions that only exist on other machines will be removed from the repo ' +
-        '(your local sessions are never deleted).',
+      'Agent Sessions Sync: make THIS machine the source of truth? Local state wins all conflicts, ' +
+        'sessions missing from the repository are re-uploaded, and local sessions are never deleted. ' +
+        'Sessions that only exist on other machines are kept in the repository.',
       { modal: true },
       'Force Local Over Remote'
     );

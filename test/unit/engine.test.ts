@@ -307,10 +307,10 @@ describe('forceLocal', () => {
     expect(p.conflicts.length).toBe(1);
   });
 
-  it('remote-only sessions are removed from the repository', () => {
-    const forced = computeSyncPlan({}, { [B]: 'remote' }, { [B]: 'base' }, unit, new Map(), new Set(), true);
-    expect(forced.removeRemote).toEqual([B]);
-    expect(forced.downloads).toEqual([]);
+  it('does NOT remove remote-only sessions from the repository', () => {
+    const forced = computeSyncPlan({}, { [B]: 'remote' }, {}, unit, new Map(), new Set(), true);
+    expect(forced.removeRemote).toEqual([]);
+    expect(forced.downloads).toEqual([B]);
     expect(forced.removeLocal).toEqual([]);
   });
 
@@ -320,9 +320,14 @@ describe('forceLocal', () => {
     expect(forced.removeLocal).toEqual([]);
   });
 
-  it('deleted-remotely sessions are kept and re-uploaded', () => {
+  it('sessions the repo lost are re-uploaded instead of deleted locally', () => {
     const forced = computeSyncPlan({ [A]: 'local' }, {}, { [A]: 'base' }, unit, new Map(), new Set(), true);
     expect(forced.uploads).toEqual([A]);
     expect(forced.removeLocal).toEqual([]);
+  });
+
+  it('a normal sync still propagates a remote deletion locally', () => {
+    const normal = plan({ [A]: 'base' }, {}, { [A]: 'base' });
+    expect(normal.removeLocal).toEqual([A]);
   });
 });

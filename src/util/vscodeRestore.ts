@@ -79,9 +79,10 @@ function resolveTarget(ctx: VscodeRestoreContext, repoFolder: string): ResolvedT
 
   // 1. Explicit mapping wins.
   let folderPath = ctx.folderMap?.toLocal.get(repoFolder);
-  // 2. Exact encode match against real local workspaces (handles hyphens).
+  // 2. Exact encode match against real local workspaces (handles hyphens), then a unique
+  //    project-name suffix match for workspaces at different paths on this machine.
   if (!folderPath) {
-    folderPath = getAllWorkspaceEntries(ctx.userDataPath).find((e) => encodeWorkspacePath(e.folderPath) === repoFolder)?.folderPath;
+    folderPath = matchLocalWorkspace(ctx.userDataPath, repoFolder);
   }
   // 3. Otherwise decode the encoded repo folder name back to a path.
   if (!folderPath) {
@@ -156,16 +157,17 @@ export function resolveVscodeLocalPath(agent: Agent, repoPath: string): string |
 }
 
 /**
- * Resolve a repo workspace folder back to the local `workspaceStorage/<hash>` dir:
+ * Resolve a repo workspace folder back to a local workspaceStorage dir:
  * 1. explicit `workspacePaths` mapping, 2. an exact encode match against the local
- * workspaces (handles hyphens in paths, unlike lossy decode), 3. best-effort decode.
+ * workspaces (handles hyphens in paths, unlike lossy decode), 3. a unique project-name
+ * suffix match (so a project at a different absolute path on this machine still maps),
+ * 4. best-effort decode.
  */
 function resolveWorkspaceStorageBase(agent: Agent, repoFolder: string): string | undefined {
   const userDataPath = path.dirname(agent.localPath);
   let folderPath = agent.folderMap?.toLocal.get(repoFolder);
   if (!folderPath) {
-    // Exact match against real local workspaces (encode is injective for these).
-    folderPath = getAllWorkspaceEntries(userDataPath).find((e) => encodeWorkspacePath(e.folderPath) === repoFolder)?.folderPath;
+    folderPath = matchLocalWorkspace(userDataPath, repoFolder);
   }
   if (!folderPath) {
     folderPath = decodeWorkspacePath(repoFolder);
@@ -175,6 +177,27 @@ function resolveWorkspaceStorageBase(agent: Agent, repoFolder: string): string |
   }
   const hash = findWorkspaceHashForFolder(userDataPath, folderPath) ?? computeWorkspaceHash(folderPath);
   return path.join(getWorkspaceStorageRoot(userDataPath), hash);
+}
+
+/**
+ * Find a local workspace folder for a repo folder: exact encoded-name match, then a unique
+ * project-name suffix match (last path segments shared). `undefined` when ambiguous.
+ */
+function matchLocalWorkspace(userDataPath: string, repoFolder: string): string | undefined {
+  const locals = getAllWorkspaceEntries(userDataPath);
+  const exact = locals.find((e) => encodeWorkspacePath(e.folderPath) === repoFolder);
+  if (exact) {
+    return exact.folderPath;
+  }
+  const suffix = repoFolder.split('-').slice(-3).join('-');
+  if (!suffix) {
+    return undefined;
+  }
+  const bySuffix = locals.filter((e) => encodeWorkspacePath(e.folderPath).endsWith(suffix));
+  if (bySuffix.length === 1) {
+    return bySuffix[0].folderPath;
+  }
+  return undefined;
 }
 
 /**
