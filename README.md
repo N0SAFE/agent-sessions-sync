@@ -57,20 +57,32 @@ point it at a custom folder in the settings.
 
 ### VS Code Copilot Chat Support
 
-VS Code stores Copilot Chat sessions in workspace storage directories that are indexed by a
-hash of the workspace folder path and its creation time (birthtime). This means sessions from
-another machine may not have the same hash, so VS Code can't find them.
+VS Code stores Copilot Chat sessions under `workspaceStorage/<hash>/`, where `<hash>` is derived
+from the workspace folder path **and its creation time (birthtime)** — so the hash is different
+on every machine even for the same project. VS Code also keeps an explicit index in a SQLite
+database (`state.vscdb`) and only shows sessions that are registered in it; it does **not** scan
+the session folder.
 
-Agent Sessions Sync handles this automatically:
-- Sessions are stored by workspace path (not by hash) in the GitHub repository
-- On download, the correct hash is computed for the current machine
-- Sessions are copied to the correct workspace storage location
-- The session index is updated so VS Code recognizes them
+Agent Sessions Sync handles both:
+- Sessions are stored in the repository **by workspace folder path**, not by the machine-specific hash
+- On each machine the correct hash is recomputed (or matched) and the sessions are written back
+- The session index (`chat.ChatSessionStore.index` + the agent-panel caches) is re-created in
+  `state.vscdb` so the sessions show up in the Chat / Agent history
+- Editing-session state (`chatEditingSessions/`) and no-folder ("empty window") sessions sync too
 
-To use VS Code Copilot Chat sync:
-1. Enable it in settings: `agentSessionsSync.agents.vscode.enabled: true`
-2. If you're using VS Code Insiders, set the variant: `agentSessionsSync.agents.vscode.variant: "Insiders"`
-3. Sessions will sync automatically across machines
+To use it:
+1. `agentSessionsSync.agents.vscode.enabled` is on by default. Leave
+   `agentSessionsSync.agents.vscode.path` empty to use the currently-running VS Code instance
+   automatically (stable, Insiders, etc.).
+2. If a project lives at a **different path** on another machine, map it with
+   `agentSessionsSync.agents.vscode.workspacePaths`:
+   `{ "<repo-folder-name>": "~/path/on/this/machine" }` — the repo folder name is the encoded
+   project path under `vscode/` (e.g. `Users-alice-my-project`). Without a mapping, sessions
+   only restore when the exact same absolute path exists on the machine.
+3. Sessions restored into a workspace that is **currently open** only appear after quitting
+   VS Code completely and reopening it (VS Code caches the index in memory and overwrites
+   external changes on shutdown). Sessions restored into workspaces you open later appear
+   immediately.
 
 ---
 
@@ -143,11 +155,15 @@ my-agent-sessions/
 ├── cursor/
 │   └── 4d5e6f…/
 └── vscode/
-    └── Users-mathis-projects-api/    ← encoded workspace path
-        ├── workspace.json            ← VS Code workspace metadata
-        └── chatSessions/
-            ├── abc123.jsonl          ← one conversation
-            └── def456.jsonl
+    ├── Users-alice-my-project/        ← encoded workspace folder path
+    │   ├── workspace.json             ← marker (real path differs per machine)
+    │   ├── chatSessions/
+    │   │   └── abc123.../
+    │   │       ├── conversation.jsonl ← one conversation
+    │   │       └── meta.json          ← its index metadata
+    │   └── chatEditingSessions/
+    │       └── abc123.../state.json   ← pending agent edits
+    └── __empty_window__/              ← sessions opened with no folder
 ```
 
 You own the data completely. You can browse it on github.com, and every change is an ordinary
@@ -239,8 +255,8 @@ status-bar menu.
 | `agentSessionsSync.agents.cursor.enabled` | `true` | Sync Cursor sessions |
 | `agentSessionsSync.agents.cursor.path` | `~/.cursor/chats` | Where Cursor sessions live |
 | `agentSessionsSync.agents.vscode.enabled` | `true` | Sync VS Code Copilot Chat sessions |
-| `agentSessionsSync.agents.vscode.path` | `~/Library/Application Support/Code/User/workspaceStorage` | Where VS Code workspace storage lives |
-| `agentSessionsSync.agents.vscode.variant` | `""` | VS Code variant (e.g., "Insiders" for VS Code Insiders) |
+| `agentSessionsSync.agents.vscode.path` | *(current VS Code)* | Where VS Code workspace storage lives |
+| `agentSessionsSync.agents.vscode.workspacePaths` | `{}` | Map repository workspace folders to their folder on *this* machine (different paths across machines) |
 | `agentSessionsSync.autoSync` | `true` | Sync automatically in the background |
 | `agentSessionsSync.pollIntervalMinutes` | `5` | How often to check for changes from other machines |
 | `agentSessionsSync.debounceSeconds` | `30` | How long to wait after a change before uploading |

@@ -21,7 +21,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const getConfig = (): RepoConfig | undefined => context.globalState.get<RepoConfig>(KEY_REPO);
   const settings = () => vscode.workspace.getConfiguration('agentSessionsSync');
-  const getAgents = (): Agent[] => getEnabledAgents();
+  // Derive the VS Code user data dir (handles Code vs Code - Insiders automatically):
+  // <userData>/globalStorage/<publisher>.<name> → up two levels.
+  const userDataPath = path.dirname(path.dirname(context.globalStorageUri.fsPath));
+  const getAgents = (): Agent[] => getEnabledAgents(userDataPath);
   const autoSyncEnabled = (): boolean => settings().get<boolean>('autoSync', true);
 
   const storageDir = context.globalStorageUri.fsPath;

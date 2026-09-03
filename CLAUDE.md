@@ -41,7 +41,8 @@ An **agent** (`src/sync/types.ts` → `Agent`) maps one local sessions directory
   - claude: depth 3 (`claude/<project>/<session>`; `memory/` becomes `claude/<proj>/memory`)
   - codex: depth ∞ (one file = one session = one unit)
   - cursor: depth 2 (`cursor/<session>`)
-  - vscode: depth 3 (`vscode/<workspace-path>/<session>`)
+  - vscode: depth 4 (`vscode/<workspace>/chatSessions/<session>` — the conversation and its
+    `meta.json`/`agent.json` sidecars fold into one unit; editing sessions are separate units)
 - The engine receives `unitOf` as a parameter (`makeUnitOf(agents)`), it does not import a
   fixed one.
 - A missing agent directory contributes nothing (scanner returns nothing for it).
@@ -67,16 +68,22 @@ Data flows one direction per module; UI never touches GitHub directly.
 - `src/sync/scanner.ts` — `scanAgents(agents, {freshMs, maxFileSize})` walks each agent dir →
   `{ files, fresh, oversized }`. Hash is the **git blob SHA-1** so it compares directly to
   GitHub tree shas. `fresh` = files modified within `freshMs` (still hashed); `oversized` =
-  skipped entirely. For VS Code, scans workspace storage directories and maps them to workspace
-  paths.
+  skipped entirely. For VS Code, scans workspace storage + the SQLite `state.vscdb` and stores
+  each session as `chatSessions/<sid>/conversation.*` + a `meta.json` sidecar, plus editing
+  sessions, keyed by the encoded workspace folder path.
 - `src/config/agents.ts` — builds the enabled `Agent[]` from settings (`getEnabledAgents`).
 - `src/util/paths.ts` — `unitOf(path, depth)`, `makeUnitOf`, `localRelToRepoPath`,
   `repoPathToLocal(agents,…)`, `repoPathToLocalRel`, `isValidRepoPath(repoDirs,…)`,
   `describeUnit`, `expandUserPath`, `claudeProjectSlug`, `buildFolderMap`.
-- `src/util/vscode.ts` — VS Code workspace storage utilities: `computeWorkspaceHash`,
-  `getWorkspaceStorageRoot`, `getAllWorkspaceEntries`, `encodeWorkspacePath`.
-- `src/util/vscodeRestore.ts` — VS Code session restoration: `restoreVscodeSessions`,
-  `findOrphanedSessions`, `writeSessionIndex`.
+- `src/util/vscode.ts` — VS Code storage internals: `computeWorkspaceHash` (md5 of folder
+  path + birthtime), `getAllWorkspaceEntries`, `encodeWorkspacePath`, `buildVscodeFolderMap`.
+- `src/util/vscodeDb.ts` — minimal `state.vscdb` (SQLite) access via **sql.js** with the wasm
+  inlined (`sql-wasm-base64.ts`); reads/writes `chat.ChatSessionStore.index`,
+  `agentSessions.model.cache`, `agentSessions.state.cache`. This is required because VS Code
+  only shows sessions that are registered in this index — it does NOT scan `chatSessions/`.
+- `src/util/vscodeRestore.ts` — resolves a repo workspace to the correct local storage dir
+  (via `workspacePaths` mapping or encoded-path decode), writes session/editing files and
+  merges per-session metadata back into `state.vscdb`.
 - `src/sync/stateStore.ts` — BASE (last-synced) state as JSON in `globalStorage`; keyed by
   repo+branch, never committed to the repo.
 - `src/sync/trash.ts` — file-list based backup + Undo before local delete/overwrite

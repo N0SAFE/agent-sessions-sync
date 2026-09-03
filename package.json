@@ -135,13 +135,16 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Local VS Code workspace storage directory. Leave empty for the default `~/Library/Application Support/Code/User/workspaceStorage` (macOS). Supports `~`."
+          "markdownDescription": "Local VS Code workspace storage directory. Leave empty to use the currently-running VS Code instance's workspace storage automatically. Supports `~`."
         },
-        "agentSessionsSync.agents.vscode.variant": {
-          "type": "string",
-          "default": "",
+        "agentSessionsSync.agents.vscode.workspacePaths": {
+          "type": "object",
+          "default": {},
           "scope": "machine",
-          "markdownDescription": "VS Code variant (e.g., 'Insiders' for VS Code Insiders). Leave empty for standard VS Code."
+          "additionalProperties": {
+            "type": "string"
+          },
+          "markdownDescription": "Map VS Code workspace folders in the repository to their directory on **this** machine, so sessions synced from machines with different project paths are restored into the right workspace. Keys are folder names under `vscode/` in the repository (another machine's encoded project path), values are local project directories (supports `~`). Without a mapping, a workspace only restores when the same absolute path exists on this machine."
         },
         "agentSessionsSync.autoSync": {
           "type": "boolean",
@@ -193,11 +196,15 @@
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "@types/sql.js": "^1.4.11",
     "@types/vscode": "^1.90.0",
     "@vscode/test-electron": "^2.4.1",
     "@vscode/vsce": "^3.1.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.5.4",
     "vitest": "^2.1.9"
+  },
+  "dependencies": {
+    "sql.js": "^1.14.2"
   }
 }

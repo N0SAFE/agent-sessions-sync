@@ -1,8 +1,9 @@
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { Agent, FolderMap } from '../sync/types';
 import { buildFolderMap, expandUserPath } from '../util/paths';
-import { getVscodeUserDataPath } from '../util/vscode';
+import { buildVscodeFolderMap, getAllWorkspaceEntries } from '../util/vscode';
 
 interface KnownAgent {
   id: string;
@@ -25,17 +26,18 @@ interface KnownAgent {
  *   is its own unit (depth ∞).
  * - cursor: `~/.cursor/chats/<session>/…` → unit is `cursor/<session>` (depth 2).
  * - vscode: `~/Library/Application Support/Code/User/workspaceStorage/<hash>/chatSessions/` →
- *   unit is `vscode/<workspace-path>/<session>` (depth 3, workspace path encoded).
+ *   unit is `vscode/<encoded-workspace-path>/<session>` (depth 4: `chatSessions/<sid>` and
+ *   its `meta.json`/`agent.json` sidecar files fold into one unit).
  */
 export const KNOWN_AGENTS: readonly KnownAgent[] = [
   { id: 'claude', label: 'Claude Code', repoDir: 'claude', defaultPath: '~/.claude/projects', unitDepth: 3 },
   { id: 'codex', label: 'Codex', repoDir: 'codex', defaultPath: '~/.codex/sessions', unitDepth: Number.POSITIVE_INFINITY },
   { id: 'cursor', label: 'Cursor', repoDir: 'cursor', defaultPath: '~/.cursor/chats', unitDepth: 2 },
-  { id: 'vscode', label: 'VS Code Copilot', repoDir: 'vscode', defaultPath: '~/Library/Application Support/Code/User/workspaceStorage', unitDepth: 3 },
+  { id: 'vscode', label: 'VS Code Copilot', repoDir: 'vscode', defaultPath: '~/.vscode', unitDepth: 4 },
 ];
 
 /** Build the list of enabled agents from settings, resolving each to an absolute local path. */
-export function getEnabledAgents(): Agent[] {
+export function getEnabledAgents(userDataPath?: string): Agent[] {
   const cfg = vscode.workspace.getConfiguration('agentSessionsSync');
   const agents: Agent[] = [];
   for (const known of KNOWN_AGENTS) {
@@ -43,23 +45,21 @@ export function getEnabledAgents(): Agent[] {
       continue;
     }
     const configured = (cfg.get<string>(`agents.${known.id}.path`, '') ?? '').trim();
-    let localPath = expandUserPath(configured || known.defaultPath);
-
-    // For VS Code agent, compute the path based on variant if not explicitly configured
-    if (known.id === 'vscode' && !configured) {
-      const variant = cfg.get<string>('agents.vscode.variant', '')?.trim();
-      if (variant) {
-        localPath = `${getVscodeUserDataPath(variant)}/workspaceStorage`;
-      }
+    let localPath: string;
+    if (known.id === 'vscode' && !configured && userDataPath) {
+      // Default to the currently running VS Code instance's workspace storage.
+      localPath = path.join(userDataPath, 'workspaceStorage');
+    } else {
+      localPath = expandUserPath(configured || known.defaultPath);
     }
-
     agents.push({
       id: known.id,
       label: known.label,
       repoDir: known.repoDir,
       localPath,
       unitDepth: known.unitDepth,
-      folderMap: known.id === 'claude' ? claudeFolderMap(cfg, localPath) : undefined,
+      folderMap:
+        known.id === 'claude' ? claudeFolderMap(cfg, localPath) : known.id === 'vscode' ? vscodeFolderMap(cfg, userDataPath) : undefined,
     });
   }
   return agents;
@@ -78,4 +78,14 @@ function claudeFolderMap(cfg: vscode.WorkspaceConfiguration, localPath: string):
     // missing sessions dir — no local folders to normalize or collide with
   }
   return buildFolderMap(entries, localFolders);
+}
+
+/** The vscode agent's workspace-folder mapping from the `workspacePaths` setting. */
+function vscodeFolderMap(cfg: vscode.WorkspaceConfiguration, userDataPath?: string): FolderMap | undefined {
+  const entries = cfg.get<Record<string, string>>('agents.vscode.workspacePaths', {}) ?? {};
+  if (Object.keys(entries).length === 0 || !userDataPath) {
+    return undefined;
+  }
+  const localFolders = getAllWorkspaceEntries(userDataPath).map((e) => e.folderPath);
+  return buildVscodeFolderMap(entries, localFolders);
 }

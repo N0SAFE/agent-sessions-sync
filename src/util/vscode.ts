@@ -4,168 +4,202 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 /**
- * Get the folder's birth/creation time in milliseconds since epoch,
- * matching VS Code's computation per platform.
+ * VS Code Copilot Chat storage internals.
  *
- * On Windows: Math.floor(stat.birthtimeMs)
- * On macOS: stat.birthtime (st_birthtime)
- * On Linux: stat.ino (inode number, since Linux ctime != birthtime)
+ * Layout:
+ *   <userData>/workspaceStorage/<hash>/workspace.json      folder URI (file:///...)
+ *   <userData>/workspaceStorage/<hash>/state.vscdb         SQLite: chat.ChatSessionStore.index,
+ *                                                          agentSessions.model.cache, agentSessions.state.cache
+ *   <userData>/workspaceStorage/<hash>/chatSessions/<sid>.jsonl|.json   conversation content
+ *   <userData>/workspaceStorage/<hash>/chatEditingSessions/<sid>/       pending agent file edits
+ *   <userData>/globalStorage/emptyWindowChatSessions/<sid>.jsonl        sessions with no folder open
+ *   <userData>/globalStorage/state.vscdb                               their index
+ *
+ * The <hash> is MD5(folderPath + birthtimeMs) — machine-specific, so sessions are synced
+ * keyed by the workspace *folder path*, and the correct hash is computed on each machine.
  */
-function getFolderBirthtimeMs(folderPath: string): number {
+
+/** Get the folder's birthtime salt VS Code uses for the storage hash. */
+function getBirthtimeSalt(folderPath: string): string {
   const stat = fs.statSync(folderPath);
   if (process.platform === 'win32') {
-    return Math.floor(stat.birthtimeMs);
-  } else if (process.platform === 'darwin') {
-    return Math.floor(stat.birthtime.getTime());
-  } else {
-    // Linux: VS Code uses the inode number
-    return stat.ino;
+    return String(Math.floor(stat.birthtimeMs));
   }
+  if (process.platform === 'darwin') {
+    return String(Math.floor(stat.birthtime.getTime()));
+  }
+  return String(stat.ino); // Linux: VS Code uses the inode (ctime is unreliable there)
 }
 
 /**
  * Compute the workspace storage hash the same way VS Code does:
- * MD5( fsPath + birthtimeStr )
- *
- * IMPORTANT: VS Code's getSingleFolderWorkspaceIdentifier uses
- * folderUri.fsPath as-is (no lowercasing) for single-folder workspaces.
- *
- * See: https://github.com/microsoft/vscode/blob/main/src/vs/platform/workspaces/node/workspaces.ts
+ *   MD5( folderUri.fsPath + birthtimeSalt )
+ * See microsoft/vscode src/vs/platform/workspaces/node/workspaces.ts.
  */
 export function computeWorkspaceHash(folderPath: string): string {
-  const birthtimeMs = getFolderBirthtimeMs(folderPath);
-  const hashInput = folderPath + String(birthtimeMs);
-  return createHash('md5').update(hashInput).digest('hex');
+  const salt = getBirthtimeSalt(folderPath);
+  return createHash('md5').update(folderPath).update(salt).digest('hex');
 }
 
 /**
- * Get the VS Code user data directory based on the platform.
+ * Resolve the VS Code user data directory (the `User` folder containing
+ * workspaceStorage/ and globalStorage/). `variant` is e.g. "Insiders".
  */
-export function getVscodeUserDataPath(variant?: string): string {
+export function getUserDataPath(variant?: string): string {
   const appName = variant ? `Code - ${variant}` : 'Code';
   if (process.platform === 'win32') {
     return path.join(os.homedir(), 'AppData', 'Roaming', appName, 'User');
-  } else if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library', 'Application Support', appName, 'User');
-  } else {
-    return path.join(os.homedir(), '.config', appName, 'User');
   }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', appName, 'User');
+  }
+  return path.join(os.homedir(), '.config', appName, 'User');
+}
+
+export function getWorkspaceStorageRoot(userDataPath: string): string {
+  return path.join(userDataPath, 'workspaceStorage');
+}
+
+export function getGlobalStoragePath(userDataPath: string): string {
+  return path.join(userDataPath, 'globalStorage');
+}
+
+/** Encode a workspace folder path into a single safe repo folder name. */
+export function encodeWorkspacePath(folderPath: string): string {
+  const clean = folderPath.replace(/[/\\:]/g, '-').replace(/^-/, '');
+  return clean || 'root';
 }
 
 /**
- * Get the workspace storage root directory.
- */
-export function getWorkspaceStorageRoot(variant?: string): string {
-  return path.join(getVscodeUserDataPath(variant), 'workspaceStorage');
-}
-
-/**
- * Encode a workspace path for use as a directory name in the repository.
- * Replaces path separators with dashes and removes colons (Windows).
- */
-export function encodeWorkspacePath(workspacePath: string): string {
-  return workspacePath
-    .replace(/[/\\]/g, '-')
-    .replace(/:/g, '')
-    .replace(/^-/, '');
-}
-
-/**
- * Decode a workspace path from a repository directory name.
+ * Best-effort decode of an encoded repo folder name back to a local path.
+ * On POSIX the leading slash is re-added. Paths containing `-` are ambiguous and
+ * should use the `workspacePaths` mapping instead.
  */
 export function decodeWorkspacePath(encoded: string): string {
-  // This is a best-effort decode; the original path is stored in workspace.json
-  return encoded;
+  let decoded = encoded.replace(/-/g, path.sep);
+  if (process.platform !== 'win32' && !decoded.startsWith(path.sep)) {
+    decoded = path.sep + decoded;
+  }
+  return decoded;
 }
 
-/**
- * Find the workspace storage directory for a given workspace path.
- * Returns the hash directory name if found, undefined otherwise.
- */
-export function findWorkspaceHash(workspaceStorageRoot: string, workspacePath: string): string | undefined {
-  if (!fs.existsSync(workspaceStorageRoot)) {
-    return undefined;
-  }
-
-  const entries = fs.readdirSync(workspaceStorageRoot, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-
-    const wsJsonPath = path.join(workspaceStorageRoot, entry.name, 'workspace.json');
-    if (!fs.existsSync(wsJsonPath)) {
-      continue;
-    }
-
-    try {
-      const wsJson = JSON.parse(fs.readFileSync(wsJsonPath, 'utf8'));
-      const folder = wsJson.folder || '';
-      // VS Code stores folder as file:///path, so we need to decode it
-      if (folder.startsWith('file://')) {
-        const decodedPath = decodeURIComponent(folder.slice(7));
-        if (decodedPath === workspacePath) {
-          return entry.name;
-        }
-      }
-    } catch {
-      // Skip invalid workspace.json files
-    }
-  }
-
-  return undefined;
-}
-
-/**
- * Get all workspace storage entries with their folder paths.
- */
+/** A single-folder workspace's storage entry. */
 export interface WorkspaceEntry {
+  /** The workspaceStorage/<hash> directory name. */
   hash: string;
+  /** Absolute folder path (decoded from workspace.json's folder URI). */
   folderPath: string;
+  /** The raw folder URI, e.g. file:///Users/alice/proj. */
   folderUri: string;
   chatSessionsDir: string;
   stateDbPath: string;
+  editingSessionsDir: string;
 }
 
-export function getAllWorkspaceEntries(variant?: string): WorkspaceEntry[] {
-  const root = getWorkspaceStorageRoot(variant);
+function parseWorkspaceJson(wsJsonPath: string): { folderPath: string; folderUri: string } | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(wsJsonPath, 'utf8')) as { folder?: string };
+    const folder = raw.folder;
+    if (folder && folder.startsWith('file://')) {
+      return { folderPath: decodeURIComponent(folder.slice('file://'.length)), folderUri: folder };
+    }
+  } catch {
+    // invalid workspace.json — skip
+  }
+  return undefined;
+}
+
+/** List every single-folder workspace storage entry (dirs with a readable workspace.json). */
+export function getAllWorkspaceEntries(userDataPath: string): WorkspaceEntry[] {
+  const root = getWorkspaceStorageRoot(userDataPath);
   if (!fs.existsSync(root)) {
     return [];
   }
-
   const entries: WorkspaceEntry[] = [];
-  const dirs = fs.readdirSync(root, { withFileTypes: true });
-
-  for (const dir of dirs) {
+  for (const dir of fs.readdirSync(root, { withFileTypes: true })) {
     if (!dir.isDirectory()) {
       continue;
     }
-
     const wsJsonPath = path.join(root, dir.name, 'workspace.json');
-    const chatSessionsDir = path.join(root, dir.name, 'chatSessions');
-    const stateDbPath = path.join(root, dir.name, 'state.vscdb');
-
-    if (!fs.existsSync(wsJsonPath)) {
+    const parsed = parseWorkspaceJson(wsJsonPath);
+    if (!parsed) {
       continue;
     }
+    const base = path.join(root, dir.name);
+    entries.push({
+      hash: dir.name,
+      folderPath: parsed.folderPath,
+      folderUri: parsed.folderUri,
+      chatSessionsDir: path.join(base, 'chatSessions'),
+      stateDbPath: path.join(base, 'state.vscdb'),
+      editingSessionsDir: path.join(base, 'chatEditingSessions'),
+    });
+  }
+  return entries;
+}
 
-    try {
-      const wsJson = JSON.parse(fs.readFileSync(wsJsonPath, 'utf8'));
-      const folder = wsJson.folder || '';
-      if (folder.startsWith('file://')) {
-        const folderPath = decodeURIComponent(folder.slice(7));
-        entries.push({
-          hash: dir.name,
-          folderPath,
-          folderUri: folder,
-          chatSessionsDir,
-          stateDbPath,
-        });
-      }
-    } catch {
-      // Skip invalid workspace.json files
+/** Find the workspaceStorage <hash> dir for a folder path already present locally, if any. */
+export function findWorkspaceHashForFolder(userDataPath: string, folderPath: string): string | undefined {
+  const normalized = path.normalize(folderPath);
+  for (const entry of getAllWorkspaceEntries(userDataPath)) {
+    if (path.normalize(entry.folderPath) === normalized) {
+      return entry.hash;
     }
   }
+  return undefined;
+}
 
-  return entries;
+/** True if the current process is running inside VS Code Insiders (used for the default path). */
+export function isInsiders(userDataPath: string): boolean {
+  return userDataPath.includes('Code - Insiders');
+}
+
+/**
+ * Mapping between repository workspace-folder names and this machine's workspace
+ * folder paths (mirrors Claude's projectPaths, but path-based for VS Code).
+ */
+export interface VscodeFolderMap {
+  /** Repository folder name → local workspace folder path. */
+  toLocal: ReadonlyMap<string, string>;
+  /** Local workspace folder path → repository folder name. */
+  toRepo: ReadonlyMap<string, string>;
+}
+
+/**
+ * Build the VS Code folder mapping from the `agents.vscode.workspacePaths` setting:
+ * each entry maps a repository folder name to a project directory on this machine.
+ */
+export function buildVscodeFolderMap(
+  entries: Readonly<Record<string, string>>,
+  localFolders: readonly string[]
+): VscodeFolderMap | undefined {
+  const byEncoded = new Map(localFolders.map((p) => [encodeWorkspacePath(p), p]));
+  const toLocal = new Map<string, string>();
+  const toRepo = new Map<string, string>();
+  for (const [repoFolder, localDir] of Object.entries(entries)) {
+    const expanded = expandUserPath(localDir);
+    if (expanded.trim() === '' || !fs.existsSync(expanded)) {
+      continue;
+    }
+    // The repo folder is normally an encoded path; allow a friendly alias too.
+    const localFolder = byEncoded.get(expanded) ?? byEncoded.get(encodeWorkspacePath(expanded));
+    if (!localFolder || toRepo.has(localFolder) || toLocal.has(repoFolder)) {
+      continue;
+    }
+    toLocal.set(repoFolder, localFolder);
+    toRepo.set(localFolder, repoFolder);
+  }
+  return toLocal.size > 0 ? { toLocal, toRepo } : undefined;
+}
+
+/** Expand a leading `~` and resolve to an absolute path. */
+export function expandUserPath(p: string): string {
+  const value = p.trim();
+  if (value === '~') {
+    return os.homedir();
+  }
+  if (value.startsWith('~/') || value.startsWith('~\\')) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+  return path.resolve(value);
 }

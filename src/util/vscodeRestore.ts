@@ -1,195 +1,338 @@
-import * as fs from 'node:fs';
+import * as fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import * as path from 'node:path';
-import { computeWorkspaceHash, decodeWorkspacePath, getAllWorkspaceEntries, getWorkspaceStorageRoot } from './vscode';
+import { FolderMap } from '../sync/types';
+import { VSCODE_EMPTY_WINDOW_FOLDER } from '../sync/scanner';
+import { openVscodeDb, parseChatIndex, AgentModelCacheEntry, AgentStateCacheEntry } from './vscodeDb';
+import {
+  computeWorkspaceHash,
+  decodeWorkspacePath,
+  findWorkspaceHashForFolder,
+  getGlobalStoragePath,
+  getWorkspaceStorageRoot,
+} from './vscode';
 
 /**
- * Parse a VS Code session index from state.vscdb.
- * This is a simplified parser that extracts the chat.ChatSessionStore.index key.
- */
-export function parseSessionIndex(stateDbPath: string): Record<string, unknown> | null {
-  try {
-    // VS Code uses a simple key-value store in state.vscdb
-    // For simplicity, we'll read the JSON file directly if it exists
-    const indexPath = path.join(path.dirname(stateDbPath), 'chatSessions', 'index.json');
-    if (fs.existsSync(indexPath)) {
-      return JSON.parse(fs.readFileSync(indexPath, 'utf8'));
-    }
-  } catch {
-    // Ignore errors
-  }
-  return null;
-}
-
-/**
- * Create or update a VS Code session index file.
- */
-export function writeSessionIndex(stateDbPath: string, index: Record<string, unknown>): void {
-  const chatSessionsDir = path.join(path.dirname(stateDbPath), 'chatSessions');
-  fs.mkdirSync(chatSessionsDir, { recursive: true });
-  const indexPath = path.join(chatSessionsDir, 'index.json');
-  fs.writeFileSync(indexPath, JSON.stringify(index, null, 2));
-}
-
-/**
- * Restore VS Code chat sessions from repository paths to the correct workspace storage location.
+ * Restore VS Code Copilot sessions from the repository into the correct local
+ * workspace storage.
  *
- * @param repoPaths Repository paths to restore (e.g., "vscode/Users-mathis-projects-myproject/chatSessions/abc.jsonl")
- * @param sourceContent Function to get the content of a file from the repository
- * @param variant VS Code variant (e.g., "Insiders" for VS Code Insiders)
+ * VS Code only shows sessions that are registered in the SQLite `state.vscdb`
+ * index (`chat.ChatSessionStore.index` + `agentSessions.*` caches) — copying the
+ * `.jsonl` files alone leaves them invisible. So restore does both:
+ *
+ *   1. writes the conversation files (and editing-session state), and
+ *   2. merges each session's index metadata into `state.vscdb`.
+ *
+ * The workspace storage hash is machine-specific (folder path + birthtime), so it
+ * is recomputed (or matched against an existing entry) on the target machine.
+ */
+
+/** Per-session sidecar metadata stored in the repo (`chatSessions/<sid>/meta.json`). */
+export interface VscodeSessionMeta {
+  format: 'jsonl' | 'json';
+  index: Record<string, unknown> | null;
+  agent: AgentModelCacheEntry | null;
+  read: number | null;
+}
+
+export interface VscodeRestoreContext {
+  /** VS Code user data directory (contains workspaceStorage/ and globalStorage/). */
+  userDataPath: string;
+  /** `agents.vscode.workspacePaths` mapping: repo folder name → local folder path. */
+  folderMap?: FolderMap;
+  /** Called when sessions were restored into the currently-open workspace (needs a restart to appear). */
+  onRestoredToOpenWorkspace?: (folderPath: string, count: number) => void;
+}
+
+/** Resolved target location for a workspace group. */
+interface ResolvedTarget {
+  folderPath: string;
+  chatSessionsDir: string;
+  editingSessionsDir: string;
+  stateDbPath: string;
+  /** workspace.json to write (folder URI on THIS machine). */
+  workspaceJson: string;
+}
+
+function folderUriFor(folderPath: string): string {
+  return 'file://' + folderPath.split(path.sep).map((s) => encodeURIComponent(s)).join('/');
+}
+
+/**
+ * Resolve where a repo workspace group should land on this machine, or undefined
+ * when no matching local folder exists.
+ */
+function resolveTarget(ctx: VscodeRestoreContext, repoFolder: string): ResolvedTarget | undefined {
+  // Empty-window (no folder) sessions live in global storage.
+  if (repoFolder === VSCODE_EMPTY_WINDOW_FOLDER) {
+    const globalPath = getGlobalStoragePath(ctx.userDataPath);
+    return {
+      folderPath: VSCODE_EMPTY_WINDOW_FOLDER,
+      chatSessionsDir: path.join(globalPath, 'emptyWindowChatSessions'),
+      editingSessionsDir: path.join(globalPath, 'emptyWindowChatSessions'),
+      stateDbPath: path.join(globalPath, 'state.vscdb'),
+      workspaceJson: JSON.stringify({ folder: VSCODE_EMPTY_WINDOW_FOLDER }),
+    };
+  }
+
+  // 1. Explicit mapping wins.
+  let folderPath = ctx.folderMap?.toLocal.get(repoFolder);
+  // 2. Otherwise decode the encoded repo folder name back to a path.
+  if (!folderPath) {
+    folderPath = decodeWorkspacePath(repoFolder);
+  }
+  if (!folderPath || !existsSync(folderPath)) {
+    return undefined;
+  }
+
+  // Find an existing storage dir for this folder, else compute the hash.
+  let hash = findWorkspaceHashForFolder(ctx.userDataPath, folderPath);
+  if (!hash) {
+    hash = computeWorkspaceHash(folderPath);
+  }
+
+  const storageRoot = getWorkspaceStorageRoot(ctx.userDataPath);
+  const base = path.join(storageRoot, hash);
+  return {
+    folderPath,
+    chatSessionsDir: path.join(base, 'chatSessions'),
+    editingSessionsDir: path.join(base, 'chatEditingSessions'),
+    stateDbPath: path.join(base, 'state.vscdb'),
+    workspaceJson: JSON.stringify({ folder: folderUriFor(folderPath) }),
+  };
+}
+
+/**
+ * Apply downloads for the vscode agent. `downloads` are repo paths like
+ * `vscode/<repoFolder>/chatSessions/<sid>/conversation.jsonl`.
  */
 export async function restoreVscodeSessions(
-  repoPaths: string[],
-  sourceContent: (repoPath: string) => Promise<Buffer>,
-  variant?: string
+  ctx: VscodeRestoreContext,
+  downloads: readonly string[],
+  getBlob: (repoPath: string) => Promise<Buffer>,
+  log: (msg: string) => void
 ): Promise<void> {
-  // Group files by workspace path
-  const byWorkspace = new Map<string, string[]>();
-  for (const repoPath of repoPaths) {
-    // Parse: vscode/<encoded-path>/chatSessions/<filename>
-    const parts = repoPath.split('/');
-    if (parts.length < 4 || parts[0] !== 'vscode') {
-      continue;
+  // Group repo paths by workspace folder name.
+  const byFolder = new Map<string, string[]>();
+  for (const p of downloads) {
+    const parts = p.split('/');
+    if (parts.length >= 3 && parts[0] === 'vscode') {
+      const list = byFolder.get(parts[1]) ?? [];
+      list.push(p);
+      byFolder.set(parts[1], list);
     }
-    const encodedPath = parts[1];
-    if (!byWorkspace.has(encodedPath)) {
-      byWorkspace.set(encodedPath, []);
-    }
-    byWorkspace.get(encodedPath)!.push(repoPath);
   }
 
-  const workspaceStorageRoot = getWorkspaceStorageRoot(variant);
-
-  for (const [encodedPath, paths] of byWorkspace) {
-    // Find the workspace folder path from workspace.json
-    const workspaceJsonPath = paths.find(p => p.endsWith('workspace.json'));
-    let folderPath: string | undefined;
-
-    if (workspaceJsonPath) {
-      try {
-        const content = await sourceContent(workspaceJsonPath);
-        const wsJson = JSON.parse(content.toString('utf8'));
-        const folder = wsJson.folder || '';
-        if (folder.startsWith('file://')) {
-          folderPath = decodeURIComponent(folder.slice(7));
-        }
-      } catch {
-        // Can't parse workspace.json, try to decode the path
-        folderPath = decodeWorkspacePath(encodedPath);
-      }
-    } else {
-      folderPath = decodeWorkspacePath(encodedPath);
-    }
-
-    if (!folderPath) {
+  for (const [repoFolder, paths] of byFolder) {
+    const target = resolveTarget(ctx, repoFolder);
+    if (!target) {
+      log(`Skipping VS Code restore for '${repoFolder}': no matching workspace folder on this machine. Set 'agentSessionsSync.agents.vscode.workspacePaths' to map it.`);
       continue;
     }
 
-    // Compute the correct workspace hash for this machine
-    const targetHash = computeWorkspaceHash(folderPath);
-    const targetDir = path.join(workspaceStorageRoot, targetHash);
-    const targetChatSessionsDir = path.join(targetDir, 'chatSessions');
-
-    // Create the directory structure
-    fs.mkdirSync(targetChatSessionsDir, { recursive: true });
-
-    // Copy workspace.json if it doesn't exist
-    const targetWsJsonPath = path.join(targetDir, 'workspace.json');
-    if (!fs.existsSync(targetWsJsonPath) && workspaceJsonPath) {
-      try {
-        const content = await sourceContent(workspaceJsonPath);
-        fs.writeFileSync(targetWsJsonPath, content);
-      } catch {
-        // Create a minimal workspace.json
-        const wsJson = { folder: `file://${folderPath}` };
-        fs.writeFileSync(targetWsJsonPath, JSON.stringify(wsJson, null, 2));
-      }
-    }
-
-    // Copy chat session files
-    for (const repoPath of paths) {
-      if (repoPath.endsWith('workspace.json')) {
-        continue; // Already handled
-      }
-
-      const filename = path.basename(repoPath);
-      const targetPath = path.join(targetChatSessionsDir, filename);
-
-      try {
-        const content = await sourceContent(repoPath);
-        fs.writeFileSync(targetPath, content);
-      } catch (e) {
-        console.error(`Failed to restore ${repoPath}:`, e);
-      }
-    }
-
-    // Update the session index in state.vscdb
-    // Note: VS Code uses SQLite for state.vscdb, but for simplicity we'll
-    // create a JSON index file that can be read by our extension
-    const sessionIndex: Record<string, unknown> = {};
-    for (const repoPath of paths) {
-      if (repoPath.endsWith('workspace.json')) {
+    // Session conversation + metadata, grouped per session id.
+    const sessionMeta = new Map<string, VscodeSessionMeta>();
+    for (const p of paths) {
+      const m = p.match(/^vscode\/[^/]+\/chatSessions\/([^/]+)\/(conversation\.(jsonl|json)|meta\.json)$/);
+      if (!m) {
         continue;
       }
-
-      const filename = path.basename(repoPath);
-      const sessionId = filename.replace('.jsonl', '');
-      sessionIndex[sessionId] = {
-        sessionId,
-        lastMessageDate: Date.now(),
-        timing: { created: Date.now() },
-        initialLocation: 'panel',
-        hasPendingEdits: false,
-        isEmpty: false,
-        isExternal: false,
-        lastResponseState: 1,
-      };
+      const sid = m[1];
+      if (m[2] === 'meta.json') {
+        try {
+          const content = await getBlob(p);
+          sessionMeta.set(sid, JSON.parse(content.toString('utf8')) as VscodeSessionMeta);
+        } catch {
+          // ignore unparseable meta
+        }
+      } else {
+        const format = m[3] as 'jsonl' | 'json';
+        const existing = sessionMeta.get(sid);
+        sessionMeta.set(sid, existing ?? { format, index: null, agent: null, read: null });
+        try {
+          const content = await getBlob(p);
+          await fs.mkdir(target.chatSessionsDir, { recursive: true });
+          await fs.writeFile(path.join(target.chatSessionsDir, `${sid}.${format}`), content);
+          log(`Restored VS Code session ${sid} (${format}) → ${target.folderPath}`);
+        } catch (e) {
+          log(`Failed to restore VS Code session ${sid}: ${String(e)}`);
+        }
+      }
     }
 
-    if (Object.keys(sessionIndex).length > 0) {
-      writeSessionIndex(path.join(targetDir, 'state.vscdb'), sessionIndex);
+    // Editing-session state files.
+    for (const p of paths) {
+      const m = p.match(/^vscode\/[^/]+\/chatEditingSessions\/(.+)$/);
+      if (!m) {
+        continue;
+      }
+      try {
+        const content = await getBlob(p);
+        const rel = m[1];
+        const dest = path.join(target.editingSessionsDir, rel);
+        await fs.mkdir(path.dirname(dest), { recursive: true });
+        await fs.writeFile(dest, content);
+      } catch (e) {
+        log(`Failed to restore VS Code editing session ${p}: ${String(e)}`);
+      }
+    }
+
+    // Write workspace.json so VS Code maps this hash dir to the local folder.
+    try {
+      await fs.mkdir(path.dirname(target.stateDbPath), { recursive: true });
+      await fs.writeFile(path.join(path.dirname(target.stateDbPath), 'workspace.json'), Buffer.from(target.workspaceJson));
+    } catch {
+      // non-fatal
+    }
+
+    // Merge session metadata into the SQLite index.
+    if (sessionMeta.size > 0) {
+      try {
+        await updateVscodeDb(target.stateDbPath, sessionMeta);
+        log(`Updated VS Code session index for ${target.folderPath} (${sessionMeta.size} session(s))`);
+      } catch (e) {
+        log(`Failed to update VS Code session index for ${target.folderPath}: ${String(e)}`);
+      }
+    }
+
+    // If the target is the currently-open workspace, VS Code's in-memory cache will
+    // shadow the DB until a restart.
+    if (ctx.onRestoredToOpenWorkspace && isOpenWorkspace(target.folderPath)) {
+      ctx.onRestoredToOpenWorkspace(target.folderPath, sessionMeta.size);
     }
   }
 }
 
-/**
- * Find orphaned VS Code sessions (sessions that don't have a matching workspace hash).
- */
-export function findOrphanedSessions(variant?: string): Array<{
-  folderPath: string;
-  currentHash: string;
-  orphanedHash: string;
-  sessions: string[];
-}> {
-  const entries = getAllWorkspaceEntries(variant);
-  const orphaned: Array<{
-    folderPath: string;
-    currentHash: string;
-    orphanedHash: string;
-    sessions: string[];
-  }> = [];
+/** True if `folderPath` is one of the folders open in the current VS Code window. */
+export function isOpenWorkspace(folderPath: string): boolean {
+  // Injected by the caller to avoid importing vscode here.
+  return openWorkspaces.has(folderPath);
+}
 
-  for (const entry of entries) {
-    const currentHash = computeWorkspaceHash(entry.folderPath);
-    if (currentHash !== entry.hash) {
-      // This workspace has an orphaned hash
-      const sessions: string[] = [];
-      try {
-        const files = fs.readdirSync(entry.chatSessionsDir);
-        sessions.push(...files.filter(f => f.endsWith('.jsonl')));
-      } catch {
-        // No chatSessions directory
-      }
+/** Set by the controller: currently open workspace folder paths. */
+export const openWorkspaces = new Set<string>();
 
-      if (sessions.length > 0) {
-        orphaned.push({
-          folderPath: entry.folderPath,
-          currentHash,
-          orphanedHash: entry.hash,
-          sessions,
-        });
+async function updateVscodeDb(dbPath: string, sessionMeta: Map<string, VscodeSessionMeta>): Promise<void> {
+  const db = await openVscodeDb(dbPath);
+
+  const index = parseChatIndex(db.get('chat.ChatSessionStore.index'));
+  for (const [sid, meta] of sessionMeta) {
+    if (meta.index) {
+      index.entries[sid] = meta.index;
+    }
+  }
+  db.set('chat.ChatSessionStore.index', JSON.stringify(index));
+
+  const agentModel = parseJsonArray<AgentModelCacheEntry>(db.get('agentSessions.model.cache'));
+  const knownResources = new Set(agentModel.map((a) => a.resource));
+  for (const [, meta] of sessionMeta) {
+    if (meta.agent && !knownResources.has(meta.agent.resource)) {
+      agentModel.push(meta.agent);
+      knownResources.add(meta.agent.resource);
+    }
+  }
+  db.set('agentSessions.model.cache', JSON.stringify(agentModel));
+
+  const agentState = parseJsonArray<AgentStateCacheEntry>(db.get('agentSessions.state.cache'));
+  const knownState = new Set(agentState.map((a) => a.resource));
+  for (const [sid, meta] of sessionMeta) {
+    if (meta.read != null) {
+      const resource = `vscode-chat-session://local/${Buffer.from(sid).toString('base64')}`;
+      if (!knownState.has(resource)) {
+        agentState.push({ resource, read: meta.read });
+        knownState.add(resource);
       }
     }
   }
+  db.set('agentSessions.state.cache', JSON.stringify(agentState));
 
-  return orphaned;
+  db.save();
+  db.close();
+}
+
+/**
+ * Remove locally-restored VS Code data for repo paths deleted on another machine:
+ * delete session files / editing state and drop the entries from the SQLite index.
+ */
+export async function removeVscodeSessions(
+  ctx: VscodeRestoreContext,
+  removePaths: readonly string[],
+  log: (msg: string) => void
+): Promise<void> {
+  const byFolder = new Map<string, string[]>();
+  for (const p of removePaths) {
+    const parts = p.split('/');
+    if (parts.length >= 3 && parts[0] === 'vscode') {
+      const list = byFolder.get(parts[1]) ?? [];
+      list.push(p);
+      byFolder.set(parts[1], list);
+    }
+  }
+
+  for (const [repoFolder, paths] of byFolder) {
+    const target = resolveTarget(ctx, repoFolder);
+    if (!target) {
+      continue;
+    }
+
+    const removedSids: string[] = [];
+    for (const p of paths) {
+      const conv = p.match(/^vscode\/[^/]+\/chatSessions\/([^/]+)\/conversation\.(jsonl|json)$/);
+      if (conv) {
+        const sid = conv[1];
+        await fs.rm(path.join(target.chatSessionsDir, `${sid}.${conv[2]}`), { force: true });
+        await fs.rm(path.join(target.editingSessionsDir, sid), { recursive: true, force: true });
+        removedSids.push(sid);
+        log(`Removed local VS Code session ${sid}`);
+        continue;
+      }
+      const edit = p.match(/^vscode\/[^/]+\/chatEditingSessions\/(.+)$/);
+      if (edit) {
+        await fs.rm(path.join(target.editingSessionsDir, edit[1]), { force: true });
+        continue;
+      }
+      if (p.endsWith('/workspace.json')) {
+        await fs.rm(path.join(path.dirname(target.stateDbPath), 'workspace.json'), { force: true });
+      }
+    }
+
+    if (removedSids.length > 0 && existsSync(target.stateDbPath)) {
+      try {
+        const db = await openVscodeDb(target.stateDbPath);
+        const index = parseChatIndex(db.get('chat.ChatSessionStore.index'));
+        for (const sid of removedSids) {
+          delete index.entries[sid];
+        }
+        db.set('chat.ChatSessionStore.index', JSON.stringify(index));
+
+        const agentModel = parseJsonArray<AgentModelCacheEntry>(db.get('agentSessions.model.cache'));
+        const agentState = parseJsonArray<AgentStateCacheEntry>(db.get('agentSessions.state.cache'));
+        const removedResources = new Set(removedSids.map((s) => `vscode-chat-session://local/${Buffer.from(s).toString('base64')}`));
+        db.set(
+          'agentSessions.model.cache',
+          JSON.stringify(agentModel.filter((a) => !removedResources.has(a.resource)))
+        );
+        db.set(
+          'agentSessions.state.cache',
+          JSON.stringify(agentState.filter((a) => !removedResources.has(a.resource)))
+        );
+        db.save();
+        db.close();
+      } catch (e) {
+        log(`Failed to update VS Code index after removal: ${String(e)}`);
+      }
+    }
+  }
+}
+
+function parseJsonArray<T>(raw: string | undefined): T[] {
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
 }

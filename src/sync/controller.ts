@@ -1,5 +1,4 @@
 import * as fs from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -8,6 +7,7 @@ import { GitHubClient, GitHubError, TreeEntry } from '../github/client';
 import { forEachLimit } from '../util/async';
 import { describeUnit, isValidRepoPath, makeUnitOf, repoPathToLocal, repoPathToLocalRel, UnitFn } from '../util/paths';
 import { repoReadmeContent } from '../util/repoTemplate';
+import { openWorkspaces, removeVscodeSessions, restoreVscodeSessions, VscodeRestoreContext } from '../util/vscodeRestore';
 import { computeSyncPlan, countUnits, mapsEqual } from './engine';
 import { ScanOptions, scanAgents } from './scanner';
 import { StateStore } from './stateStore';
@@ -95,6 +95,9 @@ export class SyncController implements vscode.Disposable {
   private trashFilesFor(agents: readonly Agent[], repoPaths: readonly string[]): TrashFile[] {
     const files: TrashFile[] = [];
     for (const p of repoPaths) {
+      if (p.startsWith('vscode/')) {
+        continue; // VS Code removals are handled by removeVscodeSessions (files + DB index)
+      }
       const absPath = repoPathToLocal(agents, p);
       const relPath = repoPathToLocalRel(agents, p);
       if (absPath && relPath) {
@@ -246,6 +249,13 @@ export class SyncController implements vscode.Disposable {
 
   /** One sync pass. Returns false when the push lost a race with another device and the pass must be re-run. */
   private async syncOnce(client: GitHubClient, cfg: RepoConfig): Promise<boolean> {
+    // Refresh which folders are open right now, so restored sessions into the current
+    // window can prompt for a restart (VS Code's in-memory index would shadow the DB write).
+    openWorkspaces.clear();
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      openWorkspaces.add(folder.uri.fsPath);
+    }
+
     const agents = this.getAgents();
     const unitFn = makeUnitOf(agents);
     const scan = await scanAgents(agents, this.getScanOptions());
@@ -458,7 +468,7 @@ export class SyncController implements vscode.Disposable {
 
     // Handle VS Code sessions specially
     if (vscodePaths.length > 0) {
-      await this.applyVscodeDownloads(client, cfg, vscodePaths, remoteFiles);
+      await this.applyVscodeDownloads(client, cfg, agents, vscodePaths, remoteFiles);
     }
 
     // Handle other agents normally
@@ -492,108 +502,41 @@ export class SyncController implements vscode.Disposable {
   private async applyVscodeDownloads(
     client: GitHubClient,
     cfg: RepoConfig,
+    agents: readonly Agent[],
     vscodePaths: string[],
     remoteFiles: FileShaMap
   ): Promise<void> {
-    // Group files by workspace path
-    const byWorkspace = new Map<string, string[]>();
-    for (const repoPath of vscodePaths) {
-      const parts = repoPath.split('/');
-      if (parts.length >= 3) {
-        const encodedPath = parts[1];
-        if (!byWorkspace.has(encodedPath)) {
-          byWorkspace.set(encodedPath, []);
-        }
-        byWorkspace.get(encodedPath)!.push(repoPath);
-      }
+    const vscodeAgent = agents.find((a) => a.repoDir === 'vscode');
+    if (!vscodeAgent) {
+      return;
     }
-
-    // Import VS Code restore utilities
-    const { computeWorkspaceHash, getWorkspaceStorageRoot } = await import('../util/vscode');
-    const { writeSessionIndex } = await import('../util/vscodeRestore');
-
-    for (const [encodedPath, paths] of byWorkspace) {
-      // Find workspace.json to get the folder path
-      const wsJsonPath = paths.find(p => p.endsWith('workspace.json'));
-      let folderPath: string | undefined;
-
-      if (wsJsonPath && remoteFiles[wsJsonPath]) {
-        try {
-          const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[wsJsonPath]);
-          const wsJson = JSON.parse(content.toString('utf8'));
-          const folder = wsJson.folder || '';
-          if (folder.startsWith('file://')) {
-            folderPath = decodeURIComponent(folder.slice(7));
-          }
-        } catch {
-          // Can't parse workspace.json
+    const ctx: VscodeRestoreContext = {
+      userDataPath: path.dirname(vscodeAgent.localPath),
+      folderMap: vscodeAgent.folderMap,
+      onRestoredToOpenWorkspace: (folderPath, count) => {
+        this.log.warn(
+          `Restored ${count} VS Code session(s) into the currently-open workspace (${folderPath}). ` +
+            'They will appear after a full VS Code restart (quit completely, then reopen).'
+        );
+        void vscode.window.showWarningMessage(
+          `Agent Sessions Sync restored ${count} VS Code session(s) into the open workspace "${folderPath}". ` +
+            'Quit VS Code completely (not just reload) and reopen for them to appear in the chat history.',
+          'OK'
+        );
+      },
+    };
+    await restoreVscodeSessions(
+      ctx,
+      vscodePaths,
+      async (repoPath) => {
+        const sha = remoteFiles[repoPath];
+        if (!sha) {
+          throw new Error(`No blob sha for ${repoPath}`);
         }
-      }
-
-      if (!folderPath) {
-        this.log.warn(`Cannot determine folder path for workspace ${encodedPath}, skipping VS Code session restore`);
-        continue;
-      }
-
-      // Compute the correct workspace hash for this machine
-      const targetHash = computeWorkspaceHash(folderPath);
-      const workspaceStorageRoot = getWorkspaceStorageRoot();
-      const targetDir = path.join(workspaceStorageRoot, targetHash);
-      const targetChatSessionsDir = path.join(targetDir, 'chatSessions');
-
-      // Create the directory structure
-      await fs.mkdir(targetChatSessionsDir, { recursive: true });
-
-      // Copy workspace.json
-      const targetWsJsonPath = path.join(targetDir, 'workspace.json');
-      if (!existsSync(targetWsJsonPath) && wsJsonPath && remoteFiles[wsJsonPath]) {
-        try {
-          const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[wsJsonPath]);
-          await fs.writeFile(targetWsJsonPath, content);
-          this.log.info(`Created workspace.json for ${folderPath}`);
-        } catch (e) {
-          this.log.warn(`Failed to create workspace.json for ${folderPath}: ${e}`);
-        }
-      }
-
-      // Copy chat session files
-      const sessionIndex: Record<string, unknown> = {};
-      for (const repoPath of paths) {
-        if (repoPath.endsWith('workspace.json')) {
-          continue;
-        }
-
-        const filename = path.basename(repoPath);
-        const targetPath = path.join(targetChatSessionsDir, filename);
-
-        try {
-          const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[repoPath]);
-          await fs.writeFile(targetPath, content);
-          this.log.info(`Downloaded VS Code session ${filename} for ${folderPath}`);
-
-          // Add to session index
-          const sessionId = filename.replace('.jsonl', '');
-          sessionIndex[sessionId] = {
-            sessionId,
-            lastMessageDate: Date.now(),
-            timing: { created: Date.now() },
-            initialLocation: 'panel',
-            hasPendingEdits: false,
-            isEmpty: false,
-            isExternal: false,
-            lastResponseState: 1,
-          };
-        } catch (e) {
-          this.log.warn(`Failed to download VS Code session ${filename}: ${e}`);
-        }
-      }
-
-      // Update session index
-      if (Object.keys(sessionIndex).length > 0) {
-        writeSessionIndex(path.join(targetDir, 'state.vscdb'), sessionIndex);
-        this.log.info(`Updated session index for ${folderPath}`);
-      }
-    }
+        return client.getBlob(cfg.owner, cfg.repo, sha);
+      },
+      (msg) => this.log.info(msg)
+    );
   }
 
   private async applyLocalRemovals(
@@ -604,8 +547,28 @@ export class SyncController implements vscode.Disposable {
     if (plan.removeLocal.length === 0) {
       return [];
     }
+
+    // VS Code removals go through the dedicated handler (deletes files AND drops
+    // the SQLite index entries so the sessions stop being listed).
+    const vscodePaths = plan.removeLocal.filter((p) => p.startsWith('vscode/'));
+    const otherPaths = plan.removeLocal.filter((p) => !p.startsWith('vscode/'));
+    if (vscodePaths.length > 0) {
+      const vscodeAgent = agents.find((a) => a.repoDir === 'vscode');
+      if (vscodeAgent) {
+        const ctx: VscodeRestoreContext = {
+          userDataPath: path.dirname(vscodeAgent.localPath),
+          folderMap: vscodeAgent.folderMap,
+        };
+        await removeVscodeSessions(ctx, vscodePaths, (m) => this.log.info(m));
+      }
+    }
+
+    if (otherPaths.length === 0) {
+      return [];
+    }
+
     const byUnit = new Map<string, string[]>();
-    for (const p of plan.removeLocal) {
+    for (const p of otherPaths) {
       const unit = unitFn(p);
       const list = byUnit.get(unit) ?? [];
       list.push(p);
