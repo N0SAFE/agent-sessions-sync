@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as vscode from 'vscode';
 import { Agent, FolderMap } from '../sync/types';
 import { buildFolderMap, expandUserPath } from '../util/paths';
+import { getVscodeUserDataPath } from '../util/vscode';
 
 interface KnownAgent {
   id: string;
@@ -23,11 +24,14 @@ interface KnownAgent {
  * - codex: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, one file per session → every file
  *   is its own unit (depth ∞).
  * - cursor: `~/.cursor/chats/<session>/…` → unit is `cursor/<session>` (depth 2).
+ * - vscode: `~/Library/Application Support/Code/User/workspaceStorage/<hash>/chatSessions/` →
+ *   unit is `vscode/<workspace-path>/<session>` (depth 3, workspace path encoded).
  */
 export const KNOWN_AGENTS: readonly KnownAgent[] = [
   { id: 'claude', label: 'Claude Code', repoDir: 'claude', defaultPath: '~/.claude/projects', unitDepth: 3 },
   { id: 'codex', label: 'Codex', repoDir: 'codex', defaultPath: '~/.codex/sessions', unitDepth: Number.POSITIVE_INFINITY },
   { id: 'cursor', label: 'Cursor', repoDir: 'cursor', defaultPath: '~/.cursor/chats', unitDepth: 2 },
+  { id: 'vscode', label: 'VS Code Copilot', repoDir: 'vscode', defaultPath: '~/Library/Application Support/Code/User/workspaceStorage', unitDepth: 3 },
 ];
 
 /** Build the list of enabled agents from settings, resolving each to an absolute local path. */
@@ -39,7 +43,16 @@ export function getEnabledAgents(): Agent[] {
       continue;
     }
     const configured = (cfg.get<string>(`agents.${known.id}.path`, '') ?? '').trim();
-    const localPath = expandUserPath(configured || known.defaultPath);
+    let localPath = expandUserPath(configured || known.defaultPath);
+
+    // For VS Code agent, compute the path based on variant if not explicitly configured
+    if (known.id === 'vscode' && !configured) {
+      const variant = cfg.get<string>('agents.vscode.variant', '')?.trim();
+      if (variant) {
+        localPath = `${getVscodeUserDataPath(variant)}/workspaceStorage`;
+      }
+    }
+
     agents.push({
       id: known.id,
       label: known.label,

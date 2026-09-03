@@ -126,6 +126,23 @@
           "scope": "machine",
           "markdownDescription": "Local Cursor sessions directory. Leave empty for the default `~/.cursor/chats`. Supports `~`."
         },
+        "agentSessionsSync.agents.vscode.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Synchronize **VS Code Copilot Chat** sessions."
+        },
+        "agentSessionsSync.agents.vscode.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Local VS Code workspace storage directory. Leave empty for the default `~/Library/Application Support/Code/User/workspaceStorage` (macOS). Supports `~`."
+        },
+        "agentSessionsSync.agents.vscode.variant": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "VS Code variant (e.g., 'Insiders' for VS Code Insiders). Leave empty for standard VS Code."
+        },
         "agentSessionsSync.autoSync": {
           "type": "boolean",
           "default": true,

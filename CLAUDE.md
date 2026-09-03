@@ -7,8 +7,8 @@ Guidance for Claude Code when working in this repository. (User-facing docs live
 
 **Agent Sessions Sync** — a VS Code extension that bidirectionally synchronizes multiple AI
 agents' local session history (Claude Code `~/.claude/projects`, Codex `~/.codex/sessions`,
-Cursor `~/.cursor/chats`) across machines through the user's own GitHub private repository.
-No local git, no custom backend, zero runtime dependencies.
+Cursor `~/.cursor/chats`, VS Code Copilot Chat) across machines through the user's own GitHub
+private repository. No local git, no custom backend, zero runtime dependencies.
 
 Sister project of **Agent Skills Sync** (`f:\-PROJECTS-\VSCode - Agent Skills Sync`), which
 shares the same architecture; this repo generalizes the sync unit and adds session-specific
@@ -31,8 +31,8 @@ Press <kbd>F5</kbd> to launch the Extension Development Host.
 
 An **agent** (`src/sync/types.ts` → `Agent`) maps one local sessions directory to one top-level
 **namespace** (`repoDir`) in the repository. Known agents and defaults live in
-`src/config/agents.ts` (`KNOWN_AGENTS`): `claude`→`claude/`, `codex`→`codex/`, `cursor`→`cursor/`.
-Each is toggled + repointed via settings `agentSessionsSync.agents.<id>.{enabled,path}`.
+`src/config/agents.ts` (`KNOWN_AGENTS`): `claude`→`claude/`, `codex`→`codex/`, `cursor`→`cursor/`,
+`vscode`→`vscode/`. Each is toggled + repointed via settings `agentSessionsSync.agents.<id>.{enabled,path}`.
 
 - The **sync/conflict unit is per-agent** (`Agent.unitDepth` + `unitOf(path, depth)` in
   `src/util/paths.ts`): the first `unitDepth` path segments; when the unit spans the whole
@@ -41,6 +41,7 @@ Each is toggled + repointed via settings `agentSessionsSync.agents.<id>.{enabled
   - claude: depth 3 (`claude/<project>/<session>`; `memory/` becomes `claude/<proj>/memory`)
   - codex: depth ∞ (one file = one session = one unit)
   - cursor: depth 2 (`cursor/<session>`)
+  - vscode: depth 3 (`vscode/<workspace-path>/<session>`)
 - The engine receives `unitOf` as a parameter (`makeUnitOf(agents)`), it does not import a
   fixed one.
 - A missing agent directory contributes nothing (scanner returns nothing for it).
@@ -66,11 +67,16 @@ Data flows one direction per module; UI never touches GitHub directly.
 - `src/sync/scanner.ts` — `scanAgents(agents, {freshMs, maxFileSize})` walks each agent dir →
   `{ files, fresh, oversized }`. Hash is the **git blob SHA-1** so it compares directly to
   GitHub tree shas. `fresh` = files modified within `freshMs` (still hashed); `oversized` =
-  skipped entirely.
+  skipped entirely. For VS Code, scans workspace storage directories and maps them to workspace
+  paths.
 - `src/config/agents.ts` — builds the enabled `Agent[]` from settings (`getEnabledAgents`).
 - `src/util/paths.ts` — `unitOf(path, depth)`, `makeUnitOf`, `localRelToRepoPath`,
   `repoPathToLocal(agents,…)`, `repoPathToLocalRel`, `isValidRepoPath(repoDirs,…)`,
   `describeUnit`, `expandUserPath`, `claudeProjectSlug`, `buildFolderMap`.
+- `src/util/vscode.ts` — VS Code workspace storage utilities: `computeWorkspaceHash`,
+  `getWorkspaceStorageRoot`, `getAllWorkspaceEntries`, `encodeWorkspacePath`.
+- `src/util/vscodeRestore.ts` — VS Code session restoration: `restoreVscodeSessions`,
+  `findOrphanedSessions`, `writeSessionIndex`.
 - `src/sync/stateStore.ts` — BASE (last-synced) state as JSON in `globalStorage`; keyed by
   repo+branch, never committed to the repo.
 - `src/sync/trash.ts` — file-list based backup + Undo before local delete/overwrite

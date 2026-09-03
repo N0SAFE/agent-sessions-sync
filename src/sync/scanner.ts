@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { encodeWorkspacePath, getAllWorkspaceEntries } from '../util/vscode';
 import { localRelToRepoPath } from '../util/paths';
 import { Agent, FileShaMap } from './types';
 
@@ -85,13 +86,95 @@ async function scanDir(agent: Agent, result: ScanResult, options: ScanOptions): 
 }
 
 /**
+ * Scan VS Code workspace storage directories for chat sessions.
+ * This handles the special structure of VS Code's workspace storage.
+ */
+async function scanVscodeAgent(agent: Agent, result: ScanResult, options: ScanOptions): Promise<void> {
+  const entries = getAllWorkspaceEntries();
+
+  for (const entry of entries) {
+    // Skip if chatSessions directory doesn't exist
+    try {
+      await fs.access(entry.chatSessionsDir);
+    } catch {
+      continue;
+    }
+
+    // Use the workspace path as the first-level directory in the repo
+    const encodedPath = encodeWorkspacePath(entry.folderPath);
+    const relBase = encodedPath;
+
+    // Scan the chatSessions directory
+    async function walkChatSessions(absDir: string, rel: string): Promise<void> {
+      let entries;
+      try {
+        entries = await fs.readdir(absDir, { withFileTypes: true });
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+          return;
+        }
+        throw e;
+      }
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) {
+          continue;
+        }
+        const childRel = rel ? `${rel}${path.sep}${entry.name}` : entry.name;
+        const childAbs = path.join(absDir, entry.name);
+        if (entry.isDirectory()) {
+          if (IGNORED_DIRS.has(entry.name.toLowerCase())) {
+            continue;
+          }
+          await walkChatSessions(childAbs, childRel);
+        } else if (entry.isFile()) {
+          if (isIgnoredFileName(entry.name)) {
+            continue;
+          }
+          // Build repo path: vscode/<encoded-workspace-path>/chatSessions/<filename>
+          const repoPath = `${agent.repoDir}/${relBase}/chatSessions/${childRel.replace(/\\/g, '/')}`;
+          const stat = await fs.stat(childAbs);
+          if (options.maxFileSize !== undefined && stat.size > options.maxFileSize) {
+            result.oversized.add(repoPath);
+            continue;
+          }
+          if (options.freshMs !== undefined && options.freshMs > 0) {
+            const now = options.now ?? Date.now();
+            if (now - stat.mtimeMs < options.freshMs) {
+              result.fresh.add(repoPath);
+            }
+          }
+          const content = await fs.readFile(childAbs);
+          result.files[repoPath] = gitBlobSha(content);
+        }
+      }
+    }
+
+    await walkChatSessions(entry.chatSessionsDir, '');
+
+    // Also store workspace.json for restoration
+    const wsJsonPath = path.join(path.dirname(entry.chatSessionsDir), 'workspace.json');
+    try {
+      const content = await fs.readFile(wsJsonPath);
+      const repoPath = `${agent.repoDir}/${relBase}/workspace.json`;
+      result.files[repoPath] = gitBlobSha(content);
+    } catch {
+      // workspace.json doesn't exist or can't be read
+    }
+  }
+}
+
+/**
  * Scan every agent's local sessions directory into a single repository-path → git blob sha map.
  * Missing directories contribute nothing (so agents the user doesn't use are simply empty).
  */
 export async function scanAgents(agents: readonly Agent[], options: ScanOptions = {}): Promise<ScanResult> {
   const result: ScanResult = { files: {}, fresh: new Set(), oversized: new Set() };
   for (const agent of agents) {
-    await scanDir(agent, result, options);
+    if (agent.id === 'vscode') {
+      await scanVscodeAgent(agent, result, options);
+    } else {
+      await scanDir(agent, result, options);
+    }
   }
   return result;
 }

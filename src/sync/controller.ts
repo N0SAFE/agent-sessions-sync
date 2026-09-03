@@ -1,4 +1,5 @@
 import * as fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -450,29 +451,149 @@ export class SyncController implements vscode.Disposable {
     if (plan.downloads.length === 0) {
       return;
     }
-    // Guard against case-collisions on case-insensitive file systems (Windows/macOS).
-    const localByLower = new Map<string, string>();
-    for (const p of Object.keys(localFiles)) {
-      localByLower.set(p.toLowerCase(), p);
+
+    // Separate VS Code downloads from other agents
+    const vscodePaths = plan.downloads.filter(p => p.startsWith('vscode/'));
+    const otherPaths = plan.downloads.filter(p => !p.startsWith('vscode/'));
+
+    // Handle VS Code sessions specially
+    if (vscodePaths.length > 0) {
+      await this.applyVscodeDownloads(client, cfg, vscodePaths, remoteFiles);
     }
-    await forEachLimit(plan.downloads, BLOB_CONCURRENCY, async (p) => {
-      const localPath = repoPathToLocal(agents, p);
-      if (!localPath) {
-        this.log.warn(`Skipping unsafe or unknown repository path: ${p}`);
-        delete plan.newBaseFiles[p];
-        return;
+
+    // Handle other agents normally
+    if (otherPaths.length > 0) {
+      // Guard against case-collisions on case-insensitive file systems (Windows/macOS).
+      const localByLower = new Map<string, string>();
+      for (const p of Object.keys(localFiles)) {
+        localByLower.set(p.toLowerCase(), p);
       }
-      const existing = localByLower.get(p.toLowerCase());
-      if (existing && existing !== p) {
-        this.log.warn(`Skipping '${p}': collides with local '${existing}' on a case-insensitive file system.`);
-        delete plan.newBaseFiles[p];
-        return;
+      await forEachLimit(otherPaths, BLOB_CONCURRENCY, async (p) => {
+        const localPath = repoPathToLocal(agents, p);
+        if (!localPath) {
+          this.log.warn(`Skipping unsafe or unknown repository path: ${p}`);
+          delete plan.newBaseFiles[p];
+          return;
+        }
+        const existing = localByLower.get(p.toLowerCase());
+        if (existing && existing !== p) {
+          this.log.warn(`Skipping '${p}': collides with local '${existing}' on a case-insensitive file system.`);
+          delete plan.newBaseFiles[p];
+          return;
+        }
+        const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[p]);
+        await fs.mkdir(path.dirname(localPath), { recursive: true });
+        await fs.writeFile(localPath, content);
+        this.log.info(`Downloaded ${p}`);
+      });
+    }
+  }
+
+  private async applyVscodeDownloads(
+    client: GitHubClient,
+    cfg: RepoConfig,
+    vscodePaths: string[],
+    remoteFiles: FileShaMap
+  ): Promise<void> {
+    // Group files by workspace path
+    const byWorkspace = new Map<string, string[]>();
+    for (const repoPath of vscodePaths) {
+      const parts = repoPath.split('/');
+      if (parts.length >= 3) {
+        const encodedPath = parts[1];
+        if (!byWorkspace.has(encodedPath)) {
+          byWorkspace.set(encodedPath, []);
+        }
+        byWorkspace.get(encodedPath)!.push(repoPath);
       }
-      const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[p]);
-      await fs.mkdir(path.dirname(localPath), { recursive: true });
-      await fs.writeFile(localPath, content);
-      this.log.info(`Downloaded ${p}`);
-    });
+    }
+
+    // Import VS Code restore utilities
+    const { computeWorkspaceHash, getWorkspaceStorageRoot } = await import('../util/vscode');
+    const { writeSessionIndex } = await import('../util/vscodeRestore');
+
+    for (const [encodedPath, paths] of byWorkspace) {
+      // Find workspace.json to get the folder path
+      const wsJsonPath = paths.find(p => p.endsWith('workspace.json'));
+      let folderPath: string | undefined;
+
+      if (wsJsonPath && remoteFiles[wsJsonPath]) {
+        try {
+          const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[wsJsonPath]);
+          const wsJson = JSON.parse(content.toString('utf8'));
+          const folder = wsJson.folder || '';
+          if (folder.startsWith('file://')) {
+            folderPath = decodeURIComponent(folder.slice(7));
+          }
+        } catch {
+          // Can't parse workspace.json
+        }
+      }
+
+      if (!folderPath) {
+        this.log.warn(`Cannot determine folder path for workspace ${encodedPath}, skipping VS Code session restore`);
+        continue;
+      }
+
+      // Compute the correct workspace hash for this machine
+      const targetHash = computeWorkspaceHash(folderPath);
+      const workspaceStorageRoot = getWorkspaceStorageRoot();
+      const targetDir = path.join(workspaceStorageRoot, targetHash);
+      const targetChatSessionsDir = path.join(targetDir, 'chatSessions');
+
+      // Create the directory structure
+      await fs.mkdir(targetChatSessionsDir, { recursive: true });
+
+      // Copy workspace.json
+      const targetWsJsonPath = path.join(targetDir, 'workspace.json');
+      if (!existsSync(targetWsJsonPath) && wsJsonPath && remoteFiles[wsJsonPath]) {
+        try {
+          const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[wsJsonPath]);
+          await fs.writeFile(targetWsJsonPath, content);
+          this.log.info(`Created workspace.json for ${folderPath}`);
+        } catch (e) {
+          this.log.warn(`Failed to create workspace.json for ${folderPath}: ${e}`);
+        }
+      }
+
+      // Copy chat session files
+      const sessionIndex: Record<string, unknown> = {};
+      for (const repoPath of paths) {
+        if (repoPath.endsWith('workspace.json')) {
+          continue;
+        }
+
+        const filename = path.basename(repoPath);
+        const targetPath = path.join(targetChatSessionsDir, filename);
+
+        try {
+          const content = await client.getBlob(cfg.owner, cfg.repo, remoteFiles[repoPath]);
+          await fs.writeFile(targetPath, content);
+          this.log.info(`Downloaded VS Code session ${filename} for ${folderPath}`);
+
+          // Add to session index
+          const sessionId = filename.replace('.jsonl', '');
+          sessionIndex[sessionId] = {
+            sessionId,
+            lastMessageDate: Date.now(),
+            timing: { created: Date.now() },
+            initialLocation: 'panel',
+            hasPendingEdits: false,
+            isEmpty: false,
+            isExternal: false,
+            lastResponseState: 1,
+          };
+        } catch (e) {
+          this.log.warn(`Failed to download VS Code session ${filename}: ${e}`);
+        }
+      }
+
+      // Update session index
+      if (Object.keys(sessionIndex).length > 0) {
+        writeSessionIndex(path.join(targetDir, 'state.vscdb'), sessionIndex);
+        this.log.info(`Updated session index for ${folderPath}`);
+      }
+    }
   }
 
   private async applyLocalRemovals(

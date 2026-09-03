@@ -49,10 +49,28 @@ Out of the box it can sync the session history of:
 | **Claude Code** | `~/.claude/projects` |
 | **Codex** | `~/.codex/sessions` |
 | **Cursor** | `~/.cursor/chats` |
+| **VS Code Copilot Chat** | `~/Library/Application Support/Code/User/workspaceStorage` (macOS) |
 
-All three are on by default, but an agent whose folder doesn't exist is simply skipped — so if
+All four are on by default, but an agent whose folder doesn't exist is simply skipped — so if
 you only use Claude Code, nothing else gets in the way. You can turn each agent on or off and
 point it at a custom folder in the settings.
+
+### VS Code Copilot Chat Support
+
+VS Code stores Copilot Chat sessions in workspace storage directories that are indexed by a
+hash of the workspace folder path and its creation time (birthtime). This means sessions from
+another machine may not have the same hash, so VS Code can't find them.
+
+Agent Sessions Sync handles this automatically:
+- Sessions are stored by workspace path (not by hash) in the GitHub repository
+- On download, the correct hash is computed for the current machine
+- Sessions are copied to the correct workspace storage location
+- The session index is updated so VS Code recognizes them
+
+To use VS Code Copilot Chat sync:
+1. Enable it in settings: `agentSessionsSync.agents.vscode.enabled: true`
+2. If you're using VS Code Insiders, set the variant: `agentSessionsSync.agents.vscode.variant: "Insiders"`
+3. Sessions will sync automatically across machines
 
 ---
 
@@ -122,8 +140,14 @@ my-agent-sessions/
 │       └── memory/
 ├── codex/
 │   └── 2026/07/16/rollout-….jsonl
-└── cursor/
-    └── 4d5e6f…/
+├── cursor/
+│   └── 4d5e6f…/
+└── vscode/
+    └── Users-mathis-projects-api/    ← encoded workspace path
+        ├── workspace.json            ← VS Code workspace metadata
+        └── chatSessions/
+            ├── abc123.jsonl          ← one conversation
+            └── def456.jsonl
 ```
 
 You own the data completely. You can browse it on github.com, and every change is an ordinary
@@ -214,6 +238,9 @@ status-bar menu.
 | `agentSessionsSync.agents.codex.path` | `~/.codex/sessions` | Where Codex sessions live |
 | `agentSessionsSync.agents.cursor.enabled` | `true` | Sync Cursor sessions |
 | `agentSessionsSync.agents.cursor.path` | `~/.cursor/chats` | Where Cursor sessions live |
+| `agentSessionsSync.agents.vscode.enabled` | `true` | Sync VS Code Copilot Chat sessions |
+| `agentSessionsSync.agents.vscode.path` | `~/Library/Application Support/Code/User/workspaceStorage` | Where VS Code workspace storage lives |
+| `agentSessionsSync.agents.vscode.variant` | `""` | VS Code variant (e.g., "Insiders" for VS Code Insiders) |
 | `agentSessionsSync.autoSync` | `true` | Sync automatically in the background |
 | `agentSessionsSync.pollIntervalMinutes` | `5` | How often to check for changes from other machines |
 | `agentSessionsSync.debounceSeconds` | `30` | How long to wait after a change before uploading |
