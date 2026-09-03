@@ -61,6 +61,11 @@
         "category": "Agent Sessions Sync"
       },
       {
+        "command": "agentSessionsSync.forceLocal",
+        "title": "Force Local Over Remote",
+        "category": "Agent Sessions Sync"
+      },
+      {
         "command": "agentSessionsSync.mapClaudeProject",
         "title": "Map Claude Project Folder",
         "category": "Agent Sessions Sync"

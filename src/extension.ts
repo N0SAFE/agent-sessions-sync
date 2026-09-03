@@ -147,6 +147,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentSessionsSync.resolveConflicts', () =>
       resolveConflictsFlow(controller, getAgents, (reason) => scheduler.requestSync(reason))
     ),
+    vscode.commands.registerCommand('agentSessionsSync.forceLocal', () => controller.forceLocalSync()),
     vscode.commands.registerCommand('agentSessionsSync.mapClaudeProject', () =>
       mapClaudeProjectFlow(controller, getConfig, getAgents, log)
     ),

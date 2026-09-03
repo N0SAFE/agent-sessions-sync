@@ -51,6 +51,7 @@ export class SyncController implements vscode.Disposable {
   private lastToken = '';
   private lastRemoteMap: FileShaMap = {};
   private readonly mirror: GitMirror;
+  private forceLocalNext = false;
 
   constructor(
     private readonly getConfig: () => RepoConfig | undefined,
@@ -146,6 +147,28 @@ export class SyncController implements vscode.Disposable {
     }
     this.resolutions.set(unit, resolution);
     this.log.info(`Conflict for ${unit} resolved as '${resolution}'`);
+  }
+
+  /**
+   * Make the next sync treat THIS machine as authoritative: local wins every conflict,
+   * sessions that only exist on the remote are removed from it, sessions only on local are
+   * re-uploaded, and nothing is deleted locally. Ask first — this can remove remote-only
+   * history.
+   */
+  async forceLocalSync(): Promise<void> {
+    const choice = await vscode.window.showWarningMessage(
+      'Agent Sessions Sync: make THIS machine the source of truth? This overwrites the repository ' +
+        'with local state — sessions that only exist on other machines will be removed from the repo ' +
+        '(your local sessions are never deleted).',
+      { modal: true },
+      'Force Local Over Remote'
+    );
+    if (choice !== 'Force Local Over Remote') {
+      return;
+    }
+    this.forceLocalNext = true;
+    this.resolutions.clear();
+    this.requestSync('force-local');
   }
 
   /** Remote file content for the diff editor, fetched by blob sha (cached). */
@@ -355,7 +378,13 @@ export class SyncController implements vscode.Disposable {
     }
     this.lastRemoteMap = remoteFiles;
 
-    const plan = computeSyncPlan(local, remoteFiles, base.files, unitFn, this.resolutions, frozen);
+    const forceLocal = this.forceLocalNext;
+    this.forceLocalNext = false;
+    if (forceLocal) {
+      this.log.info('Forcing local state to take the lead over the repository.');
+    }
+
+    const plan = computeSyncPlan(local, remoteFiles, base.files, unitFn, this.resolutions, frozen, forceLocal);
     this.log.info(
       `Plan: ${plan.uploads.length} upload(s), ${plan.downloads.length} download(s), ` +
         `${plan.removeRemote.length} remote deletion(s), ${plan.removeLocal.length} local deletion(s), ` +

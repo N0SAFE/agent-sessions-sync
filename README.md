@@ -272,6 +272,7 @@ Open the Command Palette (`Ctrl`/`Cmd` + `Shift` + `P`) and type *Agent Sessions
 - **Set Up / Change Repository** — connect GitHub or switch repositories
 - **Sync Now** — sync immediately
 - **Resolve Conflicts** — review and resolve conflicting sessions
+- **Force Local Over Remote** — make this machine the source of truth: overwrite the repository with local state (local wins all conflicts, sessions only on other machines are removed from the repo, local sessions are never deleted)
 - **Map Claude Project Folder** — make another machine's sessions appear in `claude --resume` here
 - **Open Repository on GitHub** — view your history online
 - **Show Log** — see what the extension has been doing

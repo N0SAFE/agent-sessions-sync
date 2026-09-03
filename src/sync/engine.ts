@@ -32,6 +32,10 @@ type Action = 'none' | 'upload' | 'removeRemote' | 'download' | 'removeLocal' | 
  * Units in `frozen` (sessions being actively written, oversized files) are left completely
  * untouched this run — no actions in either direction, no conflict records, BASE entries
  * kept — and reported in `plan.skipped` when they would otherwise have produced an action.
+ *
+ * With `forceLocal`, the local side is authoritative everywhere: local wins every conflict,
+ * sessions only on the remote are removed from it, sessions only on local are re-uploaded,
+ * and nothing is ever deleted locally.
  */
 export function computeSyncPlan(
   local: FileShaMap,
@@ -39,7 +43,8 @@ export function computeSyncPlan(
   base: FileShaMap,
   unitOf: UnitFn,
   resolutions: ReadonlyMap<string, ConflictResolution> = new Map(),
-  frozen: ReadonlySet<string> = new Set()
+  frozen: ReadonlySet<string> = new Set(),
+  forceLocal = false
 ): SyncPlan {
   const paths = [...new Set([...Object.keys(local), ...Object.keys(remote), ...Object.keys(base)])].sort();
   const actions = new Map<string, Action>();
@@ -49,7 +54,10 @@ export function computeSyncPlan(
     const r: string | undefined = remote[p];
     const b: string | undefined = base[p];
     const resolution = resolutions.get(unitOf(p));
-    actions.set(p, resolution ? resolvedAction(l, r, b, resolution) : classify(l, r, b));
+    actions.set(
+      p,
+      forceLocal ? resolvedAction(l, r, b, 'local') : resolution ? resolvedAction(l, r, b, resolution) : classify(l, r, b)
+    );
   }
 
   const conflictedUnits = new Set<string>();

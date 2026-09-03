@@ -41,6 +41,11 @@ export async function openMenu(
       });
     }
     items.push({
+      label: '$(arrow-up) Force Local Over Remote…',
+      detail: 'Make this machine the source of truth — overwrite the repository with local state.',
+      action: () => vscode.commands.executeCommand('agentSessionsSync.forceLocal') as Promise<void>,
+    });
+    items.push({
       label: '$(sync) Sync Now',
       action: () => vscode.commands.executeCommand('agentSessionsSync.syncNow') as Promise<void>,
     });

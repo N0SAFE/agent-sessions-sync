@@ -296,3 +296,33 @@ describe('computeSyncPlan — frozen units (active/oversized sessions)', () => {
     expect(p.uploads).toEqual([B]);
   });
 });
+
+describe('forceLocal', () => {
+  it('local wins a conflict instead of flagging it', () => {
+    const p = plan({ [A]: 'local' }, { [A]: 'remote' }, { [A]: 'base' });
+    const forced = computeSyncPlan({ [A]: 'local' }, { [A]: 'remote' }, { [A]: 'base' }, unit, new Map(), new Set(), true);
+    expect(forced.conflicts).toEqual([]);
+    expect(forced.uploads).toEqual([A]);
+    expect(forced.newBaseFiles).toEqual({ [A]: 'local' });
+    expect(p.conflicts.length).toBe(1);
+  });
+
+  it('remote-only sessions are removed from the repository', () => {
+    const forced = computeSyncPlan({}, { [B]: 'remote' }, { [B]: 'base' }, unit, new Map(), new Set(), true);
+    expect(forced.removeRemote).toEqual([B]);
+    expect(forced.downloads).toEqual([]);
+    expect(forced.removeLocal).toEqual([]);
+  });
+
+  it('local-only sessions are uploaded, never deleted locally', () => {
+    const forced = computeSyncPlan({ [A]: 'local' }, {}, {}, unit, new Map(), new Set(), true);
+    expect(forced.uploads).toEqual([A]);
+    expect(forced.removeLocal).toEqual([]);
+  });
+
+  it('deleted-remotely sessions are kept and re-uploaded', () => {
+    const forced = computeSyncPlan({ [A]: 'local' }, {}, { [A]: 'base' }, unit, new Map(), new Set(), true);
+    expect(forced.uploads).toEqual([A]);
+    expect(forced.removeLocal).toEqual([]);
+  });
+});
