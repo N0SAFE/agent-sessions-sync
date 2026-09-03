@@ -1,6 +1,6 @@
 {
-  "name": "agent-sessions-sync",
-  "displayName": "Agent Sessions Sync",
+  "name": "agent-sessions-sync-local",
+  "displayName": "Agent Sessions Sync (Local)",
   "description": "Keep your AI agent sessions (Claude Code, Codex, Cursor) synchronized across all of your computers via your own private GitHub repository.",
   "version": "0.2.0",
   "publisher": "Gregor-von-Vitek",
@@ -186,7 +186,6 @@
     "test": "vitest run",
     "pretest:integration": "npm run build && tsc -p tsconfig.integration.json",
     "test:integration": "node out-test/test/integration/runTest.js",
-    "vscode:prepublish": "node esbuild.mjs --production",
     "package": "vsce package",
     "install:local": "node scripts/install-local.mjs",
     "install": "npm run install:local"
