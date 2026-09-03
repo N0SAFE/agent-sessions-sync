@@ -7,7 +7,7 @@ import { GitHubClient, GitHubError, TreeEntry } from '../github/client';
 import { forEachLimit } from '../util/async';
 import { describeUnit, isValidRepoPath, makeUnitOf, repoPathToLocal, repoPathToLocalRel, UnitFn } from '../util/paths';
 import { repoReadmeContent } from '../util/repoTemplate';
-import { openWorkspaces, removeVscodeSessions, restoreVscodeSessions, VscodeRestoreContext } from '../util/vscodeRestore';
+import { buildVscodeDerivedFile, openWorkspaces, removeVscodeSessions, resolveVscodeLocalPath, restoreVscodeSessions, VscodeRestoreContext } from '../util/vscodeRestore';
 import { computeSyncPlan, countUnits, mapsEqual } from './engine';
 import { ScanOptions, scanAgents } from './scanner';
 import { StateStore } from './stateStore';
@@ -89,6 +89,17 @@ export class SyncController implements vscode.Disposable {
   private agentFor(unit: string): Agent | undefined {
     const repoDir = unit.split('/', 1)[0];
     return this.getAgents().find((a) => a.repoDir === repoDir);
+  }
+
+  /** The vscode agent, or a minimal stand-in whose resolver yields undefined. */
+  private static vscodeAgent(agents: readonly Agent[]): Agent {
+    return agents.find((a) => a.repoDir === 'vscode') ?? {
+      id: 'vscode',
+      label: 'VS Code',
+      repoDir: 'vscode',
+      localPath: '',
+      unitDepth: 4,
+    };
   }
 
   /** Trash-backup entries for a set of repository paths (relative to their agent's root). */
@@ -346,11 +357,29 @@ export class SyncController implements vscode.Disposable {
       }
       const blobShaByPath: Record<string, string> = {};
       await forEachLimit(plan.uploads, BLOB_CONCURRENCY, async (p) => {
-        const localPath = repoPathToLocal(agents, p);
-        if (!localPath) {
+        // VS Code repo paths map to a custom layout (workspaceStorage/<hash>/
+        // chatSessions/<sid>.jsonl, global-storage empty-window sessions) that the
+        // generic repoPathToLocal does not understand; its meta.json/workspace.json
+        // sidecars are derived from the SQLite index and generated on the fly.
+        let content: Buffer | undefined;
+        if (p.startsWith('vscode/')) {
+          const vscodeAgent = SyncController.vscodeAgent(agents);
+          const localPath = resolveVscodeLocalPath(vscodeAgent, p);
+          if (localPath) {
+            content = await fs.readFile(localPath);
+          } else {
+            content = await buildVscodeDerivedFile(vscodeAgent, p);
+          }
+        } else {
+          const localPath = repoPathToLocal(agents, p);
+          if (localPath) {
+            content = await fs.readFile(localPath);
+          }
+        }
+        if (content === undefined) {
+          this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
           return;
         }
-        const content = await fs.readFile(localPath);
         blobShaByPath[p] = await client.createBlob(cfg.owner, cfg.repo, content);
       });
       const entries: TreeEntry[] = [

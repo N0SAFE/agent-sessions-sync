@@ -1,13 +1,15 @@
 import * as fs from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import * as path from 'node:path';
-import { FolderMap } from '../sync/types';
-import { VSCODE_EMPTY_WINDOW_FOLDER } from '../sync/scanner';
+import { Agent, FolderMap } from '../sync/types';
+import { isEmptyWindowRepoFolder, VSCODE_EMPTY_WINDOW_FOLDER, VSCODE_WORKSPACE_MARKER } from '../sync/scanner';
 import { openVscodeDb, parseChatIndex, AgentModelCacheEntry, AgentStateCacheEntry } from './vscodeDb';
 import {
   computeWorkspaceHash,
   decodeWorkspacePath,
+  encodeWorkspacePath,
   findWorkspaceHashForFolder,
+  getAllWorkspaceEntries,
   getGlobalStoragePath,
   getWorkspaceStorageRoot,
 } from './vscode';
@@ -64,7 +66,7 @@ function folderUriFor(folderPath: string): string {
  */
 function resolveTarget(ctx: VscodeRestoreContext, repoFolder: string): ResolvedTarget | undefined {
   // Empty-window (no folder) sessions live in global storage.
-  if (repoFolder === VSCODE_EMPTY_WINDOW_FOLDER) {
+  if (isEmptyWindowRepoFolder(repoFolder)) {
     const globalPath = getGlobalStoragePath(ctx.userDataPath);
     return {
       folderPath: VSCODE_EMPTY_WINDOW_FOLDER,
@@ -77,7 +79,11 @@ function resolveTarget(ctx: VscodeRestoreContext, repoFolder: string): ResolvedT
 
   // 1. Explicit mapping wins.
   let folderPath = ctx.folderMap?.toLocal.get(repoFolder);
-  // 2. Otherwise decode the encoded repo folder name back to a path.
+  // 2. Exact encode match against real local workspaces (handles hyphens).
+  if (!folderPath) {
+    folderPath = getAllWorkspaceEntries(ctx.userDataPath).find((e) => encodeWorkspacePath(e.folderPath) === repoFolder)?.folderPath;
+  }
+  // 3. Otherwise decode the encoded repo folder name back to a path.
   if (!folderPath) {
     folderPath = decodeWorkspacePath(repoFolder);
   }
@@ -100,6 +106,135 @@ function resolveTarget(ctx: VscodeRestoreContext, repoFolder: string): ResolvedT
     stateDbPath: path.join(base, 'state.vscdb'),
     workspaceJson: JSON.stringify({ folder: folderUriFor(folderPath) }),
   };
+}
+
+/**
+ * Map a repository path under `vscode/` to the real local file on this machine, or
+ * `undefined` when it has no on-disk counterpart (the `meta.json`/`workspace.json`
+ * sidecars are stored in the SQLite index, not as files) or no matching workspace.
+ *
+ * Used by the upload path so local session content is read from the actual
+ * `workspaceStorage/<hash>/chatSessions/<sid>.<ext>` location instead of the
+ * generic (wrong) `repoPathToLocal` layout.
+ */
+export function resolveVscodeLocalPath(agent: Agent, repoPath: string): string | undefined {
+  if (!repoPath.startsWith('vscode/')) {
+    return undefined;
+  }
+  const userDataPath = path.dirname(agent.localPath);
+  const parts = repoPath.split('/');
+  if (parts.length < 3) {
+    return undefined;
+  }
+  const repoFolder = parts[1];
+
+  // No-folder sessions live in global storage.
+  if (isEmptyWindowRepoFolder(repoFolder)) {
+    const conv = repoPath.match(/^vscode\/[^/]+\/chatSessions\/([^/]+)\/conversation\.(jsonl|json)$/);
+    if (!conv) {
+      return undefined;
+    }
+    return path.join(getGlobalStoragePath(userDataPath), 'emptyWindowChatSessions', `${conv[1]}.${conv[2]}`);
+  }
+
+  // Editing-session state.
+  const edit = repoPath.match(/^vscode\/[^/]+\/chatEditingSessions\/(.+)$/);
+  if (edit) {
+    const base = resolveWorkspaceStorageBase(agent, repoFolder);
+    return base ? path.join(base, 'chatEditingSessions', edit[1]) : undefined;
+  }
+
+  // Conversation file.
+  const conv = repoPath.match(/^vscode\/[^/]+\/chatSessions\/([^/]+)\/conversation\.(jsonl|json)$/);
+  if (conv) {
+    const base = resolveWorkspaceStorageBase(agent, repoFolder);
+    return base ? path.join(base, 'chatSessions', `${conv[1]}.${conv[2]}`) : undefined;
+  }
+
+  // meta.json / workspace.json sidecars are DB-derived, not real files.
+  return undefined;
+}
+
+/**
+ * Resolve a repo workspace folder back to the local `workspaceStorage/<hash>` dir:
+ * 1. explicit `workspacePaths` mapping, 2. an exact encode match against the local
+ * workspaces (handles hyphens in paths, unlike lossy decode), 3. best-effort decode.
+ */
+function resolveWorkspaceStorageBase(agent: Agent, repoFolder: string): string | undefined {
+  const userDataPath = path.dirname(agent.localPath);
+  let folderPath = agent.folderMap?.toLocal.get(repoFolder);
+  if (!folderPath) {
+    // Exact match against real local workspaces (encode is injective for these).
+    folderPath = getAllWorkspaceEntries(userDataPath).find((e) => encodeWorkspacePath(e.folderPath) === repoFolder)?.folderPath;
+  }
+  if (!folderPath) {
+    folderPath = decodeWorkspacePath(repoFolder);
+  }
+  if (!folderPath || !existsSync(folderPath)) {
+    return undefined;
+  }
+  const hash = findWorkspaceHashForFolder(userDataPath, folderPath) ?? computeWorkspaceHash(folderPath);
+  return path.join(getWorkspaceStorageRoot(userDataPath), hash);
+}
+
+/**
+ * Generate the content of a DB-derived repo file for upload:
+ * - `chatSessions/<sid>/meta.json` → read the local SQLite index/agent caches
+ * - `<workspace>/workspace.json` → the path-independent marker
+ * Returns `undefined` for anything else (already covered by `resolveVscodeLocalPath`).
+ */
+export async function buildVscodeDerivedFile(agent: Agent, repoPath: string): Promise<Buffer | undefined> {
+  const meta = repoPath.match(/^vscode\/([^/]+)\/chatSessions\/([^/]+)\/meta\.json$/);
+  if (meta) {
+    const [, repoFolder, sid] = meta;
+    return buildVscodeSessionMeta(agent, repoFolder, sid);
+  }
+  if (repoPath.endsWith('/workspace.json')) {
+    const repoFolder = repoPath.split('/')[1];
+    return Buffer.from(
+      JSON.stringify({ folder: isEmptyWindowRepoFolder(repoFolder) ? VSCODE_EMPTY_WINDOW_FOLDER : VSCODE_WORKSPACE_MARKER })
+    );
+  }
+  return undefined;
+}
+
+async function buildVscodeSessionMeta(agent: Agent, repoFolder: string, sid: string): Promise<Buffer | undefined> {
+  const userDataPath = path.dirname(agent.localPath);
+  const isEmptyWindow = isEmptyWindowRepoFolder(repoFolder);
+  const storageBase = isEmptyWindow ? undefined : resolveWorkspaceStorageBase(agent, repoFolder);
+  const dbPath = isEmptyWindow
+    ? path.join(getGlobalStoragePath(userDataPath), 'state.vscdb')
+    : storageBase ? path.join(storageBase, 'state.vscdb') : '';
+  if (!dbPath || !existsSync(dbPath) || !statSync(dbPath).size) {
+    return Buffer.from(JSON.stringify({ format: 'jsonl', index: null, agent: null, read: null }));
+  }
+
+  const sessionDir = isEmptyWindow
+    ? path.join(getGlobalStoragePath(userDataPath), 'emptyWindowChatSessions')
+    : storageBase ? path.join(storageBase, 'chatSessions') : '';
+  const format: 'jsonl' | 'json' =
+    existsSync(path.join(sessionDir, `${sid}.jsonl`)) ? 'jsonl'
+      : existsSync(path.join(sessionDir, `${sid}.json`)) ? 'json'
+        : 'jsonl';
+
+  try {
+    const db = await openVscodeDb(dbPath);
+    const index = parseChatIndex(db.get('chat.ChatSessionStore.index'));
+    const agentModel = parseJsonArray<AgentModelCacheEntry>(db.get('agentSessions.model.cache'));
+    const agentState = parseJsonArray<AgentStateCacheEntry>(db.get('agentSessions.state.cache'));
+    db.close();
+
+    const resource = `vscode-chat-session://local/${Buffer.from(sid).toString('base64')}`;
+    const meta: VscodeSessionMeta = {
+      format,
+      index: index.entries[sid] ?? index.entries[resource] ?? null,
+      agent: agentModel.find((a) => a.resource === resource) ?? null,
+      read: agentState.find((a) => a.resource === resource)?.read ?? null,
+    };
+    return Buffer.from(JSON.stringify(meta));
+  } catch {
+    return Buffer.from(JSON.stringify({ format, index: null, agent: null, read: null }));
+  }
 }
 
 /**

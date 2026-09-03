@@ -14,6 +14,14 @@ const IGNORED_DIRS = new Set(['.git']);
 /** Reserved repository folder under `vscode/` for sessions opened with no folder. */
 export const VSCODE_EMPTY_WINDOW_FOLDER = '__empty_window__';
 
+/** Older builds used a single-underscore name; accept it for restore/upload tolerance. */
+export const VSCODE_EMPTY_WINDOW_FOLDER_LEGACY = 'empty_window';
+
+/** True for any spelling of the empty-window repo folder. */
+export function isEmptyWindowRepoFolder(name: string): boolean {
+  return name === VSCODE_EMPTY_WINDOW_FOLDER || name === VSCODE_EMPTY_WINDOW_FOLDER_LEGACY;
+}
+
 /** Path-independent marker stored as `<workspace>/workspace.json` (see scanner). */
 export const VSCODE_WORKSPACE_MARKER = '__workspace__';
 
