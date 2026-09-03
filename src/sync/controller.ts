@@ -361,26 +361,34 @@ export class SyncController implements vscode.Disposable {
         // chatSessions/<sid>.jsonl, global-storage empty-window sessions) that the
         // generic repoPathToLocal does not understand; its meta.json/workspace.json
         // sidecars are derived from the SQLite index and generated on the fly.
-        let content: Buffer | undefined;
-        if (p.startsWith('vscode/')) {
-          const vscodeAgent = SyncController.vscodeAgent(agents);
-          const localPath = resolveVscodeLocalPath(vscodeAgent, p);
-          if (localPath) {
-            content = await fs.readFile(localPath);
+        try {
+          let content: Buffer | undefined;
+          if (p.startsWith('vscode/')) {
+            const vscodeAgent = SyncController.vscodeAgent(agents);
+            const localPath = resolveVscodeLocalPath(vscodeAgent, p);
+            if (localPath) {
+              content = await fs.readFile(localPath);
+            } else {
+              content = await buildVscodeDerivedFile(vscodeAgent, p);
+            }
           } else {
-            content = await buildVscodeDerivedFile(vscodeAgent, p);
+            const localPath = repoPathToLocal(agents, p);
+            if (localPath) {
+              content = await fs.readFile(localPath);
+            }
           }
-        } else {
-          const localPath = repoPathToLocal(agents, p);
-          if (localPath) {
-            content = await fs.readFile(localPath);
+          if (content === undefined) {
+            this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
+            return;
           }
+          blobShaByPath[p] = await client.createBlob(cfg.owner, cfg.repo, content);
+        } catch (e) {
+          // Files can vanish between scan and upload (e.g. VS Code clears an editing
+          // session's state.json after the agent finishes). Skip them — the next scan
+          // sees the deletion and propagates it.
+          this.log.warn(`Skipping upload of ${p}: ${e instanceof Error ? e.message : String(e)}`);
+          delete plan.newBaseFiles[p];
         }
-        if (content === undefined) {
-          this.log.warn(`Skipping upload of ${p}: no local file (unresolvable workspace)`);
-          return;
-        }
-        blobShaByPath[p] = await client.createBlob(cfg.owner, cfg.repo, content);
       });
       const entries: TreeEntry[] = [
         ...plan.uploads

@@ -217,7 +217,9 @@ async function scanWorkspaceSessions(
     }
     const absBase = path.join(entry.editingSessionsDir, dir.name);
     const repoBase = `${base}/chatEditingSessions/${dir.name}`;
-    await walkTree(result, options, absBase, repoBase);
+    // Editing-session state is written during agent runs and cleared afterwards, so
+    // treat it as "fresh" — actively-written units get frozen instead of uploaded.
+    await walkTree(result, options, absBase, repoBase, true);
   }
 }
 
@@ -288,7 +290,8 @@ async function walkTree(
   result: ScanResult,
   options: ScanOptions,
   absDir: string,
-  repoDir: string
+  repoDir: string,
+  applyFresh: boolean
 ): Promise<void> {
   let entries;
   try {
@@ -304,14 +307,14 @@ async function walkTree(
       if (IGNORED_DIRS.has(entry.name.toLowerCase())) {
         continue;
       }
-      await walkTree(result, options, path.join(absDir, entry.name), `${repoDir}/${entry.name}`);
+      await walkTree(result, options, path.join(absDir, entry.name), `${repoDir}/${entry.name}`, applyFresh);
       continue;
     }
     if (entry.isFile()) {
       if (isIgnoredFileName(entry.name)) {
         continue;
       }
-      await hashFile(`${repoDir}/${entry.name}`, path.join(absDir, entry.name), result, options, false);
+      await hashFile(`${repoDir}/${entry.name}`, path.join(absDir, entry.name), result, options, applyFresh);
     }
   }
 }
