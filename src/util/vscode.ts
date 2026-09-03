@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -68,6 +69,59 @@ export function getGlobalStoragePath(userDataPath: string): string {
 export function encodeWorkspacePath(folderPath: string): string {
   const clean = folderPath.replace(/[/\\:]/g, '-').replace(/^-/, '');
   return clean || 'root';
+}
+
+/**
+ * Repo-based workspace keys: sessions are grouped by the folder's git remote identity
+ * (`owner/repo`) instead of its absolute path, so the same project maps to the same sync
+ * folder on every machine regardless of where it is cloned.
+ */
+export const REPO_KEY_PREFIX = 'repo-';
+
+/** True when a repo folder name is a repo-identity key rather than an encoded path. */
+export function isRepoKeyedFolder(repoFolder: string): boolean {
+  return repoFolder.startsWith(REPO_KEY_PREFIX);
+}
+
+/** `N0SAFE/deployer` → `repo-N0SAFE-deployer` (safe, stable across machines). */
+export function repoKeyFromIdentity(identity: string): string {
+  return REPO_KEY_PREFIX + identity.replace(/[^A-Za-z0-9._-]/g, '-');
+}
+
+/**
+ * Normalize a git remote URL to `owner/repo` (keeps nested group paths for GitLab etc.,
+ * strips protocol/credentials/host and the `.git` suffix).
+ */
+export function normalizeGitRemote(url: string): string | undefined {
+  let u = url.trim().replace(/\.git\/?$/, '');
+  if (!u) {
+    return undefined;
+  }
+  if (u.includes('@') && u.includes(':') && !u.includes('://')) {
+    // scp-like: git@github.com:owner/repo
+    u = u.slice(u.lastIndexOf(':') + 1);
+  } else {
+    // scheme://[user@]host/owner/repo
+    u = u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+    u = u.replace(/^[^/@]+@/, '');
+    u = u.replace(/^[^/]+\//, '');
+  }
+  u = u.replace(/\/+$/, '');
+  return u || undefined;
+}
+
+/** The repo identity (`owner/repo`) of a folder's `origin` remote, if it is a git repo. */
+export function gitRemoteIdentity(folderPath: string): string | undefined {
+  try {
+    const url = execFileSync('git', ['-C', folderPath, 'remote', 'get-url', 'origin'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+    }).trim();
+    return normalizeGitRemote(url);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

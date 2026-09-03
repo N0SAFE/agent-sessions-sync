@@ -64,21 +64,22 @@ database (`state.vscdb`) and only shows sessions that are registered in it; it d
 the session folder.
 
 Agent Sessions Sync handles both:
-- Sessions are stored in the repository **by workspace folder path**, not by the machine-specific hash
+- Sessions are stored in the repository **by the workspace's git repository** (`repo-<owner>-<repo>`),
+  not by the machine-specific hash or the folder's location — so the same project maps to the
+  same sync folder on every machine, wherever it is cloned
 - On each machine the correct hash is recomputed (or matched) and the sessions are written back
 - The session index (`chat.ChatSessionStore.index` + the agent-panel caches) is re-created in
   `state.vscdb` so the sessions show up in the Chat / Agent history
 - Editing-session state (`chatEditingSessions/`) and no-folder ("empty window") sessions sync too
+- Folders that are not git repos fall back to the encoded path instead
 
 To use it:
 1. `agentSessionsSync.agents.vscode.enabled` is on by default. Leave
    `agentSessionsSync.agents.vscode.path` empty to use the currently-running VS Code instance
    automatically (stable, Insiders, etc.).
-2. If a project lives at a **different path** on another machine, map it with
-   `agentSessionsSync.agents.vscode.workspacePaths`:
-   `{ "<repo-folder-name>": "~/path/on/this/machine" }` — the repo folder name is the encoded
-   project path under `vscode/` (e.g. `Users-alice-my-project`). Without a mapping, sessions
-   only restore when the exact same absolute path exists on the machine.
+2. Sessions from another machine appear once you have the same repository cloned and opened —
+   no path mapping needed. As a fallback you can also map explicitly with
+   `agentSessionsSync.agents.vscode.workspacePaths`.
 3. Sessions restored into a workspace that is **currently open** only appear after quitting
    VS Code completely and reopening it (VS Code caches the index in memory and overwrites
    external changes on shutdown). Sessions restored into workspaces you open later appear

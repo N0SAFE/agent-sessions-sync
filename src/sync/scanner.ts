@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import * as path from 'node:path';
-import { encodeWorkspacePath, getAllWorkspaceEntries, getGlobalStoragePath, WorkspaceEntry } from '../util/vscode';
+import { encodeWorkspacePath, getAllWorkspaceEntries, getGlobalStoragePath, gitRemoteIdentity, isRepoKeyedFolder, repoKeyFromIdentity, WorkspaceEntry } from '../util/vscode';
 import { openVscodeDb, parseChatIndex, AgentModelCacheEntry, AgentStateCacheEntry } from '../util/vscodeDb';
 import { localRelToRepoPath } from '../util/paths';
 import { Agent, FileShaMap } from './types';
@@ -24,6 +24,18 @@ export function isEmptyWindowRepoFolder(name: string): boolean {
 
 /** Path-independent marker stored as `<workspace>/workspace.json` (see scanner). */
 export const VSCODE_WORKSPACE_MARKER = '__workspace__';
+
+/**
+ * JSON for the workspace.json marker. Path-independent across machines; records the git
+ * repo identity for repo-keyed workspaces so the restore side can find the same project.
+ */
+export function workspaceMarkerJson(repoFolder: string, repoIdentity?: string): string {
+  const marker: Record<string, string> = { folder: VSCODE_WORKSPACE_MARKER };
+  if (isRepoKeyedFolder(repoFolder) && repoIdentity) {
+    marker.repo = repoIdentity;
+  }
+  return JSON.stringify(marker);
+}
 
 export function isIgnoredFileName(name: string): boolean {
   const lower = name.toLowerCase();
@@ -115,17 +127,23 @@ async function scanDir(agent: Agent, result: ScanResult, options: ScanOptions): 
 
 /**
  * Scan VS Code workspace storage directories for chat sessions and their SQLite index,
- * mapping each workspace to `<vscode>/<repoFolder>/…`. The repo folder name is the encoded
- * workspace folder path (or a `workspacePaths` alias); the SQLite index and agent caches are
- * stored as per-session sidecar files so a sync unit covers one session.
+ * mapping each workspace to `<vscode>/<repoFolder>/…`. The repo folder name is the folder's
+ * git remote identity (`repo-<owner>-<repo>`) when it is a git repo — so the same project
+ * maps to the same sync folder on every machine — otherwise the encoded workspace path (or a
+ * `workspacePaths` alias). The SQLite index and agent caches are stored as per-session
+ * sidecar files so a sync unit covers one session.
  */
 async function scanVscodeAgent(agent: Agent, result: ScanResult, options: ScanOptions): Promise<void> {
   const userDataPath = path.dirname(agent.localPath);
   const entries = getAllWorkspaceEntries(userDataPath);
 
   for (const entry of entries) {
-    const repoFolder = agent.folderMap?.toRepo.get(entry.folderPath) ?? encodeWorkspacePath(entry.folderPath);
-    await scanWorkspaceSessions(agent, result, options, entry, repoFolder);
+    const repoIdentity = gitRemoteIdentity(entry.folderPath);
+    const repoFolder =
+      (repoIdentity ? repoKeyFromIdentity(repoIdentity) : undefined) ??
+      agent.folderMap?.toRepo.get(entry.folderPath) ??
+      encodeWorkspacePath(entry.folderPath);
+    await scanWorkspaceSessions(agent, result, options, entry, repoFolder, repoIdentity);
   }
 
   await scanEmptyWindowSessions(agent, result, options);
@@ -137,14 +155,16 @@ async function scanWorkspaceSessions(
   result: ScanResult,
   options: ScanOptions,
   entry: WorkspaceEntry,
-  repoFolder: string
+  repoFolder: string,
+  repoIdentity?: string
 ): Promise<void> {
   const base = `${agent.repoDir}/${repoFolder}`;
 
   // workspace.json — a path-independent marker. The real folder URI differs per machine,
   // so storing it raw would make the same workspace a permanent conflict across machines;
-  // restore writes the correct local URI instead.
-  result.files[`${base}/workspace.json`] = gitBlobSha(Buffer.from(JSON.stringify({ folder: VSCODE_WORKSPACE_MARKER })));
+  // restore writes the correct local URI instead. For git workspaces it records the repo
+  // identity, which is how another machine finds its local copy of the same project.
+  result.files[`${base}/workspace.json`] = gitBlobSha(Buffer.from(workspaceMarkerJson(repoFolder, repoIdentity)));
 
   // Read the SQLite index + agent caches once per workspace.
   let index = { version: 1, entries: {} as Record<string, Record<string, unknown>> };

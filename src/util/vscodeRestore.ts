@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
 import * as path from 'node:path';
 import { Agent, FolderMap } from '../sync/types';
-import { isEmptyWindowRepoFolder, VSCODE_EMPTY_WINDOW_FOLDER, VSCODE_WORKSPACE_MARKER } from '../sync/scanner';
+import { isEmptyWindowRepoFolder, VSCODE_EMPTY_WINDOW_FOLDER, workspaceMarkerJson } from '../sync/scanner';
 import { openVscodeDb, parseChatIndex, AgentModelCacheEntry, AgentStateCacheEntry } from './vscodeDb';
 import {
   computeWorkspaceHash,
@@ -12,6 +12,9 @@ import {
   getAllWorkspaceEntries,
   getGlobalStoragePath,
   getWorkspaceStorageRoot,
+  gitRemoteIdentity,
+  isRepoKeyedFolder,
+  repoKeyFromIdentity,
 } from './vscode';
 
 /**
@@ -79,10 +82,12 @@ function resolveTarget(ctx: VscodeRestoreContext, repoFolder: string): ResolvedT
 
   // 1. Explicit mapping wins.
   let folderPath = ctx.folderMap?.toLocal.get(repoFolder);
-  // 2. Exact encode match against real local workspaces (handles hyphens), then a unique
-  //    project-name suffix match for workspaces at different paths on this machine.
+  // 2. Repo-keyed workspaces match by git remote identity; others by exact encode match or a
+  //    unique project-name suffix match against real local workspaces.
   if (!folderPath) {
-    folderPath = matchLocalWorkspace(ctx.userDataPath, repoFolder);
+    folderPath = isRepoKeyedFolder(repoFolder)
+      ? matchLocalWorkspaceByRepoKey(ctx.userDataPath, repoFolder)
+      : matchLocalWorkspace(ctx.userDataPath, repoFolder);
   }
   // 3. Otherwise decode the encoded repo folder name back to a path.
   if (!folderPath) {
@@ -158,16 +163,26 @@ export function resolveVscodeLocalPath(agent: Agent, repoPath: string): string |
 
 /**
  * Resolve a repo workspace folder back to a local workspaceStorage dir:
- * 1. explicit `workspacePaths` mapping, 2. an exact encode match against the local
- * workspaces (handles hyphens in paths, unlike lossy decode), 3. a unique project-name
- * suffix match (so a project at a different absolute path on this machine still maps),
- * 4. best-effort decode.
+ * mapping, then repo-identity (repo-keyed) / exact-encode / suffix match against real local
+ * workspaces, then best-effort decode.
  */
 function resolveWorkspaceStorageBase(agent: Agent, repoFolder: string): string | undefined {
+  const folderPath = resolveLocalFolder(agent, repoFolder);
+  if (!folderPath) {
+    return undefined;
+  }
+  const hash = findWorkspaceHashForFolder(path.dirname(agent.localPath), folderPath) ?? computeWorkspaceHash(folderPath);
+  return path.join(getWorkspaceStorageRoot(path.dirname(agent.localPath)), hash);
+}
+
+/** The local folder path for a repo workspace folder, or undefined. */
+function resolveLocalFolder(agent: Agent, repoFolder: string): string | undefined {
   const userDataPath = path.dirname(agent.localPath);
   let folderPath = agent.folderMap?.toLocal.get(repoFolder);
   if (!folderPath) {
-    folderPath = matchLocalWorkspace(userDataPath, repoFolder);
+    folderPath = isRepoKeyedFolder(repoFolder)
+      ? matchLocalWorkspaceByRepoKey(userDataPath, repoFolder)
+      : matchLocalWorkspace(userDataPath, repoFolder);
   }
   if (!folderPath) {
     folderPath = decodeWorkspacePath(repoFolder);
@@ -175,13 +190,13 @@ function resolveWorkspaceStorageBase(agent: Agent, repoFolder: string): string |
   if (!folderPath || !existsSync(folderPath)) {
     return undefined;
   }
-  const hash = findWorkspaceHashForFolder(userDataPath, folderPath) ?? computeWorkspaceHash(folderPath);
-  return path.join(getWorkspaceStorageRoot(userDataPath), hash);
+  return folderPath;
 }
 
 /**
- * Find a local workspace folder for a repo folder: exact encoded-name match, then a unique
- * project-name suffix match (last path segments shared). `undefined` when ambiguous.
+ * Find a local workspace folder for a path-keyed repo folder: exact encoded-name match,
+ * then a unique project-name suffix match (last path segments shared). `undefined` when
+ * ambiguous.
  */
 function matchLocalWorkspace(userDataPath: string, repoFolder: string): string | undefined {
   const locals = getAllWorkspaceEntries(userDataPath);
@@ -200,6 +215,30 @@ function matchLocalWorkspace(userDataPath: string, repoFolder: string): string |
   return undefined;
 }
 
+/** Short-lived cache of local repo identity (repoKey → folderPath), to avoid re-spawning git. */
+let repoIndexCache: { userDataPath: string; at: number; map: Map<string, string> } | undefined;
+
+function localRepoIndex(userDataPath: string): Map<string, string> {
+  const now = Date.now();
+  if (repoIndexCache && repoIndexCache.userDataPath === userDataPath && now - repoIndexCache.at < 5000) {
+    return repoIndexCache.map;
+  }
+  const map = new Map<string, string>();
+  for (const entry of getAllWorkspaceEntries(userDataPath)) {
+    const identity = gitRemoteIdentity(entry.folderPath);
+    if (identity) {
+      map.set(repoKeyFromIdentity(identity), entry.folderPath);
+    }
+  }
+  repoIndexCache = { userDataPath, at: now, map };
+  return map;
+}
+
+/** Map a repo-keyed folder (`repo-N0SAFE-deployer`) to the local folder with the same remote. */
+function matchLocalWorkspaceByRepoKey(userDataPath: string, repoFolder: string): string | undefined {
+  return localRepoIndex(userDataPath).get(repoFolder);
+}
+
 /**
  * Generate the content of a DB-derived repo file for upload:
  * - `chatSessions/<sid>/meta.json` → read the local SQLite index/agent caches
@@ -214,9 +253,17 @@ export async function buildVscodeDerivedFile(agent: Agent, repoPath: string): Pr
   }
   if (repoPath.endsWith('/workspace.json')) {
     const repoFolder = repoPath.split('/')[1];
-    return Buffer.from(
-      JSON.stringify({ folder: isEmptyWindowRepoFolder(repoFolder) ? VSCODE_EMPTY_WINDOW_FOLDER : VSCODE_WORKSPACE_MARKER })
-    );
+    if (isEmptyWindowRepoFolder(repoFolder)) {
+      return Buffer.from(JSON.stringify({ folder: VSCODE_EMPTY_WINDOW_FOLDER }));
+    }
+    let repoIdentity: string | undefined;
+    if (isRepoKeyedFolder(repoFolder)) {
+      const folderPath = resolveLocalFolder(agent, repoFolder);
+      if (folderPath) {
+        repoIdentity = gitRemoteIdentity(folderPath);
+      }
+    }
+    return Buffer.from(workspaceMarkerJson(repoFolder, repoIdentity));
   }
   return undefined;
 }
